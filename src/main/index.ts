@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, session, shell } from 'electron';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +8,7 @@ import { CredentialStore } from './engine/credential-store';
 import { AccountService, summarizeError } from './engine/account-service';
 import { TreeSorterService } from './engine/tree-sorter-service';
 import { buildMailExport, extractJson, parseTreeImport, toCsv } from './engine/tree-export';
+import { createAppUrlCheck, guardIpc, hardenWebContents, isPermissionAllowed, throttleOpens } from './security';
 
 // An AI-written tree is a few KB; anything far bigger is the wrong file
 const MAX_IMPORT_BYTES = 2 * 1024 * 1024;
@@ -22,6 +23,8 @@ process.env.VITE_PUBLIC = app.isPackaged ? process.env.DIST : path.join(process.
 
 let win: BrowserWindow | null;
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
+const INDEX_HTML = path.join(__dirname, '../dist/index.html');
+const isAppUrl = createAppUrlCheck({ devServerUrl: VITE_DEV_SERVER_URL, indexHtml: INDEX_HTML });
 
 const storageService = new StorageService();
 const modEngine = new ModEngine();
@@ -45,6 +48,13 @@ async function toResult<T>(run: () => Promise<T>): Promise<IpcResult<T>> {
   }
 }
 
+// Every channel answers only the app's own page; a foreign page or an email frame is refused
+const { handle, on } = guardIpc(ipcMain, isAppUrl);
+
+const openExternal = throttleOpens((url) => {
+  shell.openExternal(url).catch((err) => console.error('Could not open link:', err instanceof Error ? err.message : err));
+});
+
 function createWindow() {
   win = new BrowserWindow({
     width: 1280,
@@ -60,16 +70,23 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       nodeIntegration: false,
       contextIsolation: true,
-      sandbox: false,
+      sandbox: true,
     },
   });
 
   if (VITE_DEV_SERVER_URL) {
     win.loadURL(VITE_DEV_SERVER_URL);
   } else {
-    win.loadFile(path.join(__dirname, '../dist/index.html'));
+    win.loadFile(INDEX_HTML);
   }
 }
+
+// Covers every window and frame host, including any created later
+app.on('web-contents-created', (_, contents) => {
+  // DevTools reports as 'remote' and runs on devtools:// pages of its own; it never shows mail
+  if (contents.getType() === 'remote') return;
+  hardenWebContents(contents, { isAppUrl, openExternal });
+});
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
@@ -85,76 +102,76 @@ app.on('activate', () => {
 });
 
 // IPC Handler Registrations
-ipcMain.handle('get-providers', async () => {
+handle('get-providers', async () => {
   return storageService.getProviders();
 });
 
-ipcMain.handle('add-provider', async (_, input: AddAccountInput) => {
+handle('add-provider', async (_, input: AddAccountInput) => {
   return toResult(() => accountService.addAccount(input));
 });
 
-ipcMain.handle('sync-provider', async (_, providerId: string) => {
+handle('sync-provider', async (_, providerId: string) => {
   return toResult(() => accountService.sync(providerId));
 });
 
-ipcMain.handle('remove-provider', async (_, providerId: string) => {
+handle('remove-provider', async (_, providerId: string) => {
   return toResult(async () => {
     await accountService.forget(providerId);
     storageService.removeProvider(providerId);
   });
 });
 
-ipcMain.handle('get-folders', async (_, providerId) => {
+handle('get-folders', async (_, providerId) => {
   return storageService.getFolders(providerId);
 });
 
-ipcMain.handle('get-associations', async (_, providerId) => {
+handle('get-associations', async (_, providerId) => {
   return storageService.getAssociations(providerId);
 });
 
-ipcMain.handle('reorder-associations', async (_, providerId, associationIds) => {
+handle('reorder-associations', async (_, providerId, associationIds) => {
   return storageService.reorderAssociations(providerId, associationIds);
 });
 
-ipcMain.handle('add-association', async (_, providerId, name, icon, withDefaultAgendas = true, keywords = []) => {
+handle('add-association', async (_, providerId, name, icon, withDefaultAgendas = true, keywords = []) => {
   return toResult(async () => storageService.addAssociation(providerId, name, icon, withDefaultAgendas !== false, keywords));
 });
 
-ipcMain.handle('add-agenda', async (_, providerId, associationId, name, category, keywords = []) => {
+handle('add-agenda', async (_, providerId, associationId, name, category, keywords = []) => {
   return toResult(async () => storageService.addAgenda(providerId, associationId, name, category, keywords));
 });
 
-ipcMain.handle('rename-tree-node', async (_, providerId: string, nodeId: string, name: string) => {
+handle('rename-tree-node', async (_, providerId: string, nodeId: string, name: string) => {
   return toResult(async () => storageService.renameNode(providerId, nodeId, name));
 });
 
-ipcMain.handle('set-node-keywords', async (_, providerId: string, nodeId: string, keywords: string[]) => {
+handle('set-node-keywords', async (_, providerId: string, nodeId: string, keywords: string[]) => {
   return toResult(async () => storageService.setNodeKeywords(providerId, nodeId, keywords));
 });
 
-ipcMain.handle('delete-tree-node', async (_, providerId: string, nodeId: string) => {
+handle('delete-tree-node', async (_, providerId: string, nodeId: string) => {
   return toResult(async () => storageService.deleteTreeNode(providerId, nodeId));
 });
 
 // Keyword Tree Sorter mod
-ipcMain.handle('get-tree-sorter', async (_, providerId: string) => {
+handle('get-tree-sorter', async (_, providerId: string) => {
   return toResult(async () => treeSorter.getState(providerId));
 });
 
-ipcMain.handle('save-tree-sorter-settings', async (_, providerId: string, settings: Partial<TreeSorterSettings>) => {
+handle('save-tree-sorter-settings', async (_, providerId: string, settings: Partial<TreeSorterSettings>) => {
   return toResult(async () => treeSorter.saveSettings(providerId, settings));
 });
 
-ipcMain.handle('run-tree-sorter', async (_, providerId: string, apply: boolean) => {
+handle('run-tree-sorter', async (_, providerId: string, apply: boolean) => {
   return toResult(async () => treeSorter.run(providerId, apply === true));
 });
 
-ipcMain.handle('clear-tree-sorter', async (_, providerId: string) => {
+handle('clear-tree-sorter', async (_, providerId: string) => {
   return toResult(async () => treeSorter.clear(providerId));
 });
 
 // "Design my tree with AI": export the mail list (with instructions for the agent), then import its answer
-ipcMain.handle('export-mail-list', async (_, providerId: string) => {
+handle('export-mail-list', async (_, providerId: string) => {
   return toResult(async () => {
     const provider = storageService.getProvider(providerId);
     if (!provider || !win) throw new Error('Account not found.');
@@ -175,7 +192,7 @@ ipcMain.handle('export-mail-list', async (_, providerId: string) => {
   });
 });
 
-ipcMain.handle('import-tree', async (_, providerId: string, mode: unknown) => {
+handle('import-tree', async (_, providerId: string, mode: unknown) => {
   return toResult(async () => {
     if (!storageService.getProvider(providerId) || !win) throw new Error('Account not found.');
     const { canceled, filePaths } = await dialog.showOpenDialog(win, {
@@ -191,74 +208,81 @@ ipcMain.handle('import-tree', async (_, providerId: string, mode: unknown) => {
 });
 
 // People view: received mail grouped by sender or domain
-ipcMain.handle('get-sender-groups', async (_, providerId: string, mode: SenderGroupMode) => {
+handle('get-sender-groups', async (_, providerId: string, mode: SenderGroupMode) => {
   return toResult(async () => storageService.getSenderGroups(providerId, mode));
 });
 
-ipcMain.handle('mark-filter-read', async (_, providerId: string, filterId: string) => {
+handle('mark-filter-read', async (_, providerId: string, filterId: string) => {
   return toResult(async () => storageService.markFilterRead(providerId, filterId));
 });
 
-ipcMain.handle('reorder-emails', async (_, providerId, emailIds) => {
+handle('reorder-emails', async (_, providerId, emailIds) => {
   return storageService.reorderEmails(providerId, emailIds);
 });
 
-ipcMain.handle('reassign-email-tree', async (_, providerId, emailId, associationId, agendaId) => {
+handle('reassign-email-tree', async (_, providerId, emailId, associationId, agendaId) => {
   storageService.reassignEmailTree(providerId, emailId, associationId, agendaId);
   return true;
 });
 
-ipcMain.handle('get-emails', async (_, providerId, folderId) => {
+handle('get-emails', async (_, providerId, folderId) => {
   return storageService.getEmails(providerId, folderId);
 });
 
-ipcMain.handle('get-email-detail', async (_, providerId, emailId) => {
+handle('get-email-detail', async (_, providerId, emailId) => {
   return storageService.getEmailDetail(providerId, emailId);
 });
 
-ipcMain.handle('mark-email-read', async (_, providerId, emailId, isRead) => {
+handle('mark-email-read', async (_, providerId, emailId, isRead) => {
   storageService.markEmailRead(providerId, emailId, isRead);
   return true;
 });
 
-ipcMain.handle('toggle-star', async (_, providerId, emailId) => {
+handle('toggle-star', async (_, providerId, emailId) => {
   return storageService.toggleStar(providerId, emailId);
 });
 
-ipcMain.handle('send-email', async (_, input: SendEmailInput) => {
+handle('send-email', async (_, input: SendEmailInput) => {
   return toResult(() => accountService.send(input));
 });
 
-ipcMain.handle('get-mods', async () => {
+handle('get-mods', async () => {
   return modEngine.getRules();
 });
 
-ipcMain.handle('toggle-mod', async (_, modId) => {
+handle('toggle-mod', async (_, modId) => {
   return modEngine.toggleRule(modId);
 });
 
-ipcMain.handle('save-mod-rule', async (_, rule) => {
+handle('save-mod-rule', async (_, rule) => {
   return modEngine.saveRule(rule);
 });
 
-ipcMain.handle('run-mod-on-email', async (_, modId, emailId, providerId) => {
+handle('run-mod-on-email', async (_, modId, emailId, providerId) => {
   const email = storageService.getEmailDetail(providerId, emailId);
   if (!email) return { success: false };
   const res = modEngine.executeModsOnEmail(email);
   return { success: true, appliedMods: res.appliedMods };
 });
 
-ipcMain.on('window-minimize', () => win?.minimize());
-ipcMain.on('window-maximize', () => {
+on('window-minimize', () => win?.minimize());
+on('window-maximize', () => {
   if (win?.isMaximized()) {
     win.unmaximize();
   } else {
     win?.maximize();
   }
 });
-ipcMain.on('window-close', () => win?.close());
+on('window-close', () => win?.close());
 
 app.whenReady().then(() => {
+  session.defaultSession.setPermissionRequestHandler((_, permission, callback, details) => {
+    callback(isPermissionAllowed(permission, details.requestingUrl, isAppUrl));
+  });
+  // Synchronous checks (permissions.query, device lists) follow the same rule as prompts
+  session.defaultSession.setPermissionCheckHandler((contents, permission, _origin, details) =>
+    isPermissionAllowed(permission, details.requestingUrl || contents?.getURL() || '', isAppUrl)
+  );
   createWindow();
   void accountService.startWatching();
 });

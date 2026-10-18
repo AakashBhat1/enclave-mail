@@ -29,3 +29,7 @@ etspl/
 
 # Project docs live in the second_brain vault; the local copy is not versioned
 docs/
+
+# Playwright e2e output
+test-results/
+playwright-report/

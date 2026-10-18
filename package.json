@@ -8,7 +8,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:e2e": "pnpm build && playwright test"
   },
   "keywords": [
     "email",
@@ -32,6 +33,7 @@
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.1",
     "@types/dompurify": "^3.0.5",
     "@types/mailparser": "^3.4.5",
     "@types/node": "^22.13.1",
@@ -46,7 +48,6 @@
     "typescript": "^5.7.3",
     "vite": "^6.1.0",
     "vite-plugin-electron": "^0.29.0",
-    "vite-plugin-electron-renderer": "^0.14.6",
     "vitest": "^3.2.7"
   }
 }
