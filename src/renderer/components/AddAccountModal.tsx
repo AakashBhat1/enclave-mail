@@ -139,7 +139,7 @@ function AddAccountForm({ onAddProvider, onClose, onConnectingChange }: AddAccou
 
         <label className="block">
           <Label>Display name</Label>
-          <input type="text" required placeholder="e.g. ETSPL Team" value={name} onChange={(e) => setName(e.target.value)} className="field" />
+          <input type="text" required placeholder="e.g. Work inbox" value={name} onChange={(e) => setName(e.target.value)} className="field" />
         </label>
 
         <label className="block">
