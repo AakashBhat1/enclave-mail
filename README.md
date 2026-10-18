@@ -9,7 +9,7 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-C4541C)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-E3A33A)
 
-![Enclave Mail desktop email client: inbox with association tree, message list and reading pane](docs/screenshots/inbox-light.jpg)
+![Enclave Mail desktop email client: inbox with association tree, message list and reading pane](assets/screenshots/inbox-light.jpg)
 
 ---
 
@@ -46,15 +46,15 @@
 
 | Dark theme | Composer |
 |---|---|
-| ![Enclave Mail dark mode email reading pane](docs/screenshots/reading-dark.jpg) | ![Enclave Mail email composer on ruled letter paper](docs/screenshots/composer.jpg) |
+| ![Enclave Mail dark mode email reading pane](assets/screenshots/reading-dark.jpg) | ![Enclave Mail email composer on ruled letter paper](assets/screenshots/composer.jpg) |
 
 | Send animation | Add a mailbox |
 |---|---|
-| ![Sent email sealed in a 3D envelope with a wax seal](docs/screenshots/send-ceremony.jpg) | ![Add a Gmail, Outlook or IMAP account](docs/screenshots/add-account.jpg) |
+| ![Sent email sealed in a 3D envelope with a wax seal](assets/screenshots/send-ceremony.jpg) | ![Add a Gmail, Outlook or IMAP account](assets/screenshots/add-account.jpg) |
 
 | Association tree |  |
 |---|---|
-| ![Move an email in the account, association and agenda tree](docs/screenshots/tree-move.jpg) |  |
+| ![Move an email in the account, association and agenda tree](assets/screenshots/tree-move.jpg) |  |
 
 > Screenshots use fictional demo data.
 

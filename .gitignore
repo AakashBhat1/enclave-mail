@@ -26,3 +26,6 @@ Thumbs.db
 
 # Mail exports and AI-made trees (real mail data, never commit)
 etspl/
+
+# Project docs live in the second_brain vault; the local copy is not versioned
+docs/
