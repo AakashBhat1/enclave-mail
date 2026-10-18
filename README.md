@@ -65,8 +65,8 @@
 Requirements: **Node.js 20+** and **pnpm**.
 
 ```bash
-git clone https://github.com/AakashBhat1/enclave-mail-desktop-email-client.git
-cd enclave-mail-desktop-email-client
+git clone https://github.com/AakashBhat1/enclave-mail.git
+cd enclave-mail
 pnpm install
 pnpm dev        # runs the app with hot reload
 ```
