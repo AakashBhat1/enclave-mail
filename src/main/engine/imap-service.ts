@@ -2,7 +2,14 @@ import { ImapFlow, ListResponse } from 'imapflow';
 import { simpleParser, AddressObject, ParsedMail } from 'mailparser';
 import { EmailMessage, MailServerConfig } from '../../renderer/types/index';
 
-const RECENT_MESSAGE_LIMIT = 50;
+// A sync downloads the newest letters straight away; older history arrives through the background backfill
+const QUICK_DOWNLOAD_LIMIT = 50;
+// Read state is refreshed for the newest letters only; flags on years-old mail rarely change
+const SEEN_WINDOW = 500;
+// History is fetched in batches so other IMAP work (IDLE, Sent copies) can interleave
+export const BACKFILL_BATCH_SIZE = 40;
+// Letters bigger than this are stored partially during backfill (the text usually comes first)
+const BACKFILL_MAX_BYTES = 512 * 1024;
 const SNIPPET_LENGTH = 120;
 const IMPLICIT_TLS_PORT = 993;
 
@@ -22,12 +29,20 @@ export interface KnownFolder {
 export interface FolderSnapshot {
   folder: RemoteFolder;
   uidValidity: string;
-  /** UIDs currently inside the newest-N window on the server. */
-  windowUids: number[];
-  /** Server \Seen state for every UID in the window. */
+  /** Every UID currently in the folder on the server. */
+  serverUids: number[];
+  /** Server \Seen state for the newest SEEN_WINDOW letters. */
   seen: Record<number, boolean>;
-  /** Full messages, only for UIDs the app did not have yet. */
+  /** Full messages, only for the newest UIDs the app did not have yet. */
   newMessages: EmailMessage[];
+  /** Older UIDs still missing locally, newest first; the history backfill fetches these. */
+  pendingUids: number[];
+}
+
+/** Splits what is missing locally into "download now" (newest) and "backfill later", both newest first. */
+export function planDownloads(serverUids: number[], cached: Set<number>, quickLimit = QUICK_DOWNLOAD_LIMIT): { now: number[]; later: number[] } {
+  const missing = [...serverUids].sort((a, b) => b - a).filter((uid) => !cached.has(uid));
+  return { now: missing.slice(0, quickLimit), later: missing.slice(quickLimit) };
 }
 
 const SPECIAL_USE_MAP: Record<string, LocalFolderId> = {
@@ -88,8 +103,24 @@ function firstAddress(field: AddressObject | AddressObject[] | undefined): { nam
   return objects.flatMap((o) => o.value).map((a) => ({ name: a.name || a.address || '', address: a.address || '' }));
 }
 
-function toEmailMessage(parsed: ParsedMail, uidValidity: string, uid: number, flags: Set<string>, folderId: LocalFolderId, providerId: string): EmailMessage {
-  const date = parsed.date ?? new Date();
+function isValidDate(value: Date | undefined): value is Date {
+  return value instanceof Date && !Number.isNaN(value.getTime());
+}
+
+function toEmailMessage(
+  parsed: ParsedMail,
+  uidValidity: string,
+  uid: number,
+  flags: Set<string>,
+  folderId: LocalFolderId,
+  providerId: string,
+  truncated = false,
+  /** When the server received it; the fallback for letters with no Date header. */
+  arrivedAt?: Date
+): EmailMessage {
+  // A letter with no (or a broken) Date header keeps its server arrival time, never "now",
+  // or an old letter would jump to the top of the inbox every time it is downloaded
+  const date = isValidDate(parsed.date) ? parsed.date : arrivedAt ?? new Date(0);
   const text = parsed.text ?? '';
   const sender = firstAddress(parsed.from)[0] ?? { name: 'Unknown sender', address: '' };
   return {
@@ -107,6 +138,7 @@ function toEmailMessage(parsed: ParsedMail, uidValidity: string, uid: number, fl
     snippet: text.replace(/\s+/g, ' ').trim().slice(0, SNIPPET_LENGTH),
     bodyText: text,
     bodyHtml: parsed.html || undefined,
+    ...(truncated ? { bodyTruncated: true } : {}),
     isRead: flags.has('\\Seen'),
     isStarred: flags.has('\\Flagged'),
     tags: [],
@@ -120,39 +152,73 @@ function toEmailMessage(parsed: ParsedMail, uidValidity: string, uid: number, fl
   };
 }
 
-async function fetchRecent(client: ImapFlow, folder: RemoteFolder, providerId: string, known?: KnownFolder): Promise<FolderSnapshot> {
+interface RawMessage {
+  uid: number;
+  flags: Set<string>;
+  source: Buffer;
+  truncated: boolean;
+  arrivedAt?: Date;
+}
+
+async function downloadSources(client: ImapFlow, uids: number[], maxBytes?: number): Promise<RawMessage[]> {
+  if (uids.length === 0) return [];
+  const raw: RawMessage[] = [];
+  const source = maxBytes ? { maxLength: maxBytes } : true;
+  for await (const msg of client.fetch(uids.join(','), { uid: true, flags: true, size: true, internalDate: true, source }, { uid: true })) {
+    if (!msg.source) continue;
+    raw.push({
+      uid: msg.uid,
+      flags: msg.flags ?? new Set(),
+      source: msg.source,
+      truncated: !!maxBytes && (msg.size ?? 0) > msg.source.length,
+      arrivedAt: msg.internalDate ? new Date(msg.internalDate) : undefined,
+    });
+  }
+  return raw;
+}
+
+// Parse after the fetch loop (other work mid-iteration can stall the IMAP stream), one at a time to cap memory
+async function parseAll(raw: RawMessage[], uidValidity: string, folder: RemoteFolder, providerId: string): Promise<EmailMessage[]> {
+  const parsed: EmailMessage[] = [];
+  for (const r of raw) {
+    try {
+      parsed.push(toEmailMessage(await simpleParser(r.source), uidValidity, r.uid, r.flags, folder.id, providerId, r.truncated, r.arrivedAt));
+    } catch (err) {
+      console.error(`[imap] could not parse ${folder.id} uid ${r.uid}:`, err instanceof Error ? err.message : err);
+    }
+  }
+  return parsed;
+}
+
+async function fetchFolder(client: ImapFlow, folder: RemoteFolder, providerId: string, known?: KnownFolder): Promise<FolderSnapshot> {
   const lock = await client.getMailboxLock(folder.path);
+  let raw: RawMessage[] = [];
+  let snapshot: FolderSnapshot;
   try {
     const exists = client.mailbox ? client.mailbox.exists : 0;
     const uidValidity = client.mailbox ? String(client.mailbox.uidValidity) : '0';
-    const snapshot: FolderSnapshot = { folder, uidValidity, windowUids: [], seen: {}, newMessages: [] };
+    snapshot = { folder, uidValidity, serverUids: [], seen: {}, newMessages: [], pendingUids: [] };
     if (exists === 0) return snapshot;
 
-    // Pass 1 is flags only: a few hundred bytes per message, so it costs almost nothing
-    const range = `${Math.max(1, exists - RECENT_MESSAGE_LIMIT + 1)}:*`;
-    for await (const msg of client.fetch(range, { uid: true, flags: true })) {
-      snapshot.windowUids.push(msg.uid);
+    // UID SEARCH ALL returns only numbers, so listing a mailbox of thousands stays cheap
+    const uids = await client.search({ all: true }, { uid: true });
+    // imapflow returns false on a server error; an empty list for a non-empty folder is just as wrong.
+    // Treating either as "the folder is empty" would wipe every local letter in it, so fail the sync instead.
+    if (!uids || uids.length === 0) throw new Error(`Could not list the messages in ${folder.path}.`);
+    snapshot.serverUids = uids;
+    for await (const msg of client.fetch(`${Math.max(1, exists - SEEN_WINDOW + 1)}:*`, { uid: true, flags: true })) {
       snapshot.seen[msg.uid] = msg.flags?.has('\\Seen') ?? false;
     }
 
     // A changed UIDVALIDITY means the server renumbered the folder, so nothing cached can be trusted
     const cached = known && known.uidValidity === uidValidity ? known.uids : new Set<number>();
-    const missing = snapshot.windowUids.filter((uid) => !cached.has(uid));
-    if (missing.length === 0) return snapshot;
-
-    // Pass 2 downloads full sources, but only for messages we have never seen
-    const raw: { uid: number; flags: Set<string>; source: Buffer }[] = [];
-    for await (const msg of client.fetch(missing.join(','), { uid: true, flags: true, source: true }, { uid: true })) {
-      if (msg.source) raw.push({ uid: msg.uid, flags: msg.flags ?? new Set(), source: msg.source });
-    }
-    // Parse after the fetch loop (other work mid-iteration can stall the IMAP stream), one at a time to cap memory
-    for (const r of raw) {
-      snapshot.newMessages.push(toEmailMessage(await simpleParser(r.source), uidValidity, r.uid, r.flags, folder.id, providerId));
-    }
-    return snapshot;
+    const plan = planDownloads(snapshot.serverUids, cached);
+    snapshot.pendingUids = plan.later;
+    raw = await downloadSources(client, plan.now);
   } finally {
     lock.release();
   }
+  return { ...snapshot, newMessages: await parseAll(raw, snapshot.uidValidity, folder, providerId) };
 }
 
 export class ImapService {
@@ -180,11 +246,43 @@ export class ImapService {
     const snapshots: FolderSnapshot[] = [];
     for (const folder of ordered) {
       const t = Date.now();
-      snapshots.push(await fetchRecent(client, folder, providerId, known.get(folder.id)));
+      snapshots.push(await fetchFolder(client, folder, providerId, known.get(folder.id)));
       phases.push(`${folder.id} ${Date.now() - t}ms`);
     }
     console.info(`[imap] ${phases.join(', ')}, total ${Date.now() - started}ms`);
     return snapshots;
+  }
+
+  /**
+   * Downloads one batch of older letters. Returns null when the folder was renumbered since the plan
+   * was made (the next sync re-plans). INBOX is re-selected afterwards so IDLE keeps watching it.
+   */
+  public static async fetchHistoryBatch(
+    client: ImapFlow,
+    folder: RemoteFolder,
+    providerId: string,
+    uidValidity: string,
+    uids: number[]
+  ): Promise<EmailMessage[] | null> {
+    let raw: RawMessage[] = [];
+    try {
+      const lock = await client.getMailboxLock(folder.path);
+      try {
+        if (!client.mailbox || String(client.mailbox.uidValidity) !== uidValidity) return null;
+        raw = await downloadSources(client, uids, BACKFILL_MAX_BYTES);
+      } finally {
+        lock.release();
+      }
+    } finally {
+      // Every exit path (renumbered folder, failed fetch) must hand INBOX back to IDLE, or live mail stops
+      if (folder.id !== 'inbox' && client.usable) {
+        await client
+          .getMailboxLock('INBOX')
+          .then((inbox) => inbox.release())
+          .catch((err) => console.error('Could not reselect INBOX:', err instanceof Error ? err.message : err));
+      }
+    }
+    return parseAll(raw, uidValidity, folder, providerId);
   }
 
   // Many hosts (cPanel, etc.) do not file SMTP-sent mail automatically, so store a copy ourselves

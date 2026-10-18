@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { AddAccountInput, SendEmailInput } from '../renderer/types/index';
+import type { AddAccountInput, SendEmailInput, SenderGroupMode, SyncProgress, TreeSorterSettings } from '../renderer/types/index';
 
 export const electronAPI = {
   // Provider Enclaves
@@ -18,9 +18,26 @@ export const electronAPI = {
   // Association & Agenda Tree
   getAssociations: (providerId: string) => ipcRenderer.invoke('get-associations', providerId),
   reorderAssociations: (providerId: string, associationIds: string[]) => ipcRenderer.invoke('reorder-associations', providerId, associationIds),
-  addAssociation: (providerId: string, name: string, icon?: string) => ipcRenderer.invoke('add-association', providerId, name, icon),
-  addAgenda: (providerId: string, associationId: string, name: string, category?: string) =>
-    ipcRenderer.invoke('add-agenda', providerId, associationId, name, category),
+  addAssociation: (providerId: string, name: string, icon?: string, withDefaultAgendas = true, keywords: string[] = []) =>
+    ipcRenderer.invoke('add-association', providerId, name, icon, withDefaultAgendas, keywords),
+  addAgenda: (providerId: string, associationId: string, name: string, category?: string, keywords: string[] = []) =>
+    ipcRenderer.invoke('add-agenda', providerId, associationId, name, category, keywords),
+  renameTreeNode: (providerId: string, nodeId: string, name: string) => ipcRenderer.invoke('rename-tree-node', providerId, nodeId, name),
+  setNodeKeywords: (providerId: string, nodeId: string, keywords: string[]) => ipcRenderer.invoke('set-node-keywords', providerId, nodeId, keywords),
+  deleteTreeNode: (providerId: string, nodeId: string) => ipcRenderer.invoke('delete-tree-node', providerId, nodeId),
+
+  // Keyword Tree Sorter mod
+  getTreeSorter: (providerId: string) => ipcRenderer.invoke('get-tree-sorter', providerId),
+  saveTreeSorterSettings: (providerId: string, settings: Partial<TreeSorterSettings>) =>
+    ipcRenderer.invoke('save-tree-sorter-settings', providerId, settings),
+  runTreeSorter: (providerId: string, apply: boolean) => ipcRenderer.invoke('run-tree-sorter', providerId, apply),
+  clearTreeSorter: (providerId: string) => ipcRenderer.invoke('clear-tree-sorter', providerId),
+  exportMailList: (providerId: string) => ipcRenderer.invoke('export-mail-list', providerId),
+  importTree: (providerId: string, mode: 'merge' | 'replace') => ipcRenderer.invoke('import-tree', providerId, mode),
+
+  // People view
+  getSenderGroups: (providerId: string, mode: SenderGroupMode) => ipcRenderer.invoke('get-sender-groups', providerId, mode),
+  markFilterRead: (providerId: string, filterId: string) => ipcRenderer.invoke('mark-filter-read', providerId, filterId),
   reorderEmails: (providerId: string, emailIds: string[]) => ipcRenderer.invoke('reorder-emails', providerId, emailIds),
   reassignEmailTree: (providerId: string, emailId: string, associationId: string, agendaId: string) =>
     ipcRenderer.invoke('reassign-email-tree', providerId, emailId, associationId, agendaId),
@@ -30,6 +47,13 @@ export const electronAPI = {
     const handler = (_event: Electron.IpcRendererEvent, update: { providerId: string; newInbox: number }) => listener(update);
     ipcRenderer.on('mail-updated', handler);
     return () => ipcRenderer.removeListener('mail-updated', handler);
+  },
+
+  // History download progress after an account is added (or resumed after a restart)
+  onSyncProgress: (listener: (progress: SyncProgress) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, progress: SyncProgress) => listener(progress);
+    ipcRenderer.on('sync-progress', handler);
+    return () => ipcRenderer.removeListener('sync-progress', handler);
   },
 
   // Outbound SMTP

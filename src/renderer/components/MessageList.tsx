@@ -1,4 +1,4 @@
-import { useState, type MouseEvent } from 'react';
+import { useEffect, useRef, useState, type MouseEvent } from 'react';
 import { AnimatePresence, LayoutGroup, motion } from 'motion/react';
 import { Mic, Search, X } from 'lucide-react';
 import { AssociationNode, EmailMessage } from '../types/index';
@@ -22,9 +22,34 @@ interface MessageListProps {
   onSelectFolder?: (folderId: string) => void;
   onReorderEmails?: (emailIds: string[]) => void;
   onOpenTreeMove?: (email: EmailMessage) => void;
+  /** True only for Tree views (associations/agendas); folders and People stay newest first. */
+  canReorder?: boolean;
 }
 
 type FilterMode = 'all' | 'unread' | 'starred';
+
+// With full history a folder can hold thousands of letters; rows mount a page at a time as you scroll
+const PAGE_SIZE = 80;
+
+/** Grows the rendered window when the sentinel at the bottom of the list scrolls into view. */
+function usePagedCount(resetKey: string): [number, (node: HTMLDivElement | null) => void] {
+  const [count, setCount] = useState(PAGE_SIZE);
+  const observer = useRef<IntersectionObserver | null>(null);
+  useEffect(() => setCount(PAGE_SIZE), [resetKey]);
+  useEffect(() => () => observer.current?.disconnect(), []);
+  const sentinel = (node: HTMLDivElement | null) => {
+    observer.current?.disconnect();
+    if (!node) return;
+    observer.current = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) setCount((n) => n + PAGE_SIZE);
+      },
+      { rootMargin: '400px' }
+    );
+    observer.current.observe(node);
+  };
+  return [count, sentinel];
+}
 
 export function MessageList({
   emails,
@@ -39,10 +64,12 @@ export function MessageList({
   onSelectFolder,
   onReorderEmails,
   onOpenTreeMove,
+  canReorder = false,
 }: MessageListProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [filterMode, setFilterMode] = useState<FilterMode>('all');
   const [lastVoiceQuery, setLastVoiceQuery] = useState<string | null>(null);
+  const [visibleCount, sentinelRef] = usePagedCount(`${listKey}|${filterMode}|${searchQuery}`);
 
   // Row indices refer to the filtered view, so swap the two visible neighbours inside the full order
   const handleMoveEmail = (index: number, direction: 'up' | 'down', e: MouseEvent) => {
@@ -201,7 +228,7 @@ export function MessageList({
         ) : (
           <LayoutGroup id={listKey}>
             <div key={listKey} className="space-y-0.5">
-              {filteredEmails.map((email, index) => (
+              {filteredEmails.slice(0, visibleCount).map((email, index) => (
                 <MessageRow
                   key={email.id}
                   email={email}
@@ -212,10 +239,15 @@ export function MessageList({
                   associations={associations}
                   onSelect={onSelectEmail}
                   onToggleStar={onToggleStar}
-                  onMove={handleMoveEmail}
+                  onMove={canReorder ? handleMoveEmail : undefined}
                   onOpenTreeMove={onOpenTreeMove}
                 />
               ))}
+              {filteredEmails.length > visibleCount && (
+                <div ref={sentinelRef} className="py-3 text-center text-[11px] text-muted">
+                  Showing {visibleCount.toLocaleString()} of {filteredEmails.length.toLocaleString()}…
+                </div>
+              )}
             </div>
           </LayoutGroup>
         )}

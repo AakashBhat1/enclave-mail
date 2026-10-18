@@ -1,11 +1,17 @@
-import { app, BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain } from 'electron';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { StorageService, PROVIDERS_DIR } from './engine/storage-service';
 import { ModEngine } from './engine/mod-engine';
 import { CredentialStore } from './engine/credential-store';
 import { AccountService, summarizeError } from './engine/account-service';
-import type { AddAccountInput, IpcResult, SendEmailInput } from '../renderer/types/index';
+import { TreeSorterService } from './engine/tree-sorter-service';
+import { buildMailExport, extractJson, parseTreeImport, toCsv } from './engine/tree-export';
+
+// An AI-written tree is a few KB; anything far bigger is the wrong file
+const MAX_IMPORT_BYTES = 2 * 1024 * 1024;
+import type { AddAccountInput, IpcResult, SendEmailInput, SenderGroupMode, TreeSorterSettings } from '../renderer/types/index';
 
 // ESM has no __dirname; derive it from this module's URL
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -19,10 +25,15 @@ const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
 
 const storageService = new StorageService();
 const modEngine = new ModEngine();
-// Background syncs (server push, reconnects, startup) tell the window to refresh what it shows
-const accountService = new AccountService(storageService, new CredentialStore(PROVIDERS_DIR), (providerId, newInbox) => {
-  win?.webContents.send('mail-updated', { providerId, newInbox });
-});
+const treeSorter = new TreeSorterService(storageService);
+// Background syncs (server push, reconnects, startup, history download) tell the window to refresh what it shows
+const accountService = new AccountService(
+  storageService,
+  new CredentialStore(PROVIDERS_DIR),
+  (providerId, newInbox) => win?.webContents.send('mail-updated', { providerId, newInbox }),
+  (progress) => win?.webContents.send('sync-progress', progress),
+  (providerId) => treeSorter.autoRun(providerId)
+);
 
 // Wrap network-facing handlers so the renderer always gets a readable error instead of a rejected promise
 async function toResult<T>(run: () => Promise<T>): Promise<IpcResult<T>> {
@@ -105,12 +116,87 @@ ipcMain.handle('reorder-associations', async (_, providerId, associationIds) => 
   return storageService.reorderAssociations(providerId, associationIds);
 });
 
-ipcMain.handle('add-association', async (_, providerId, name, icon) => {
-  return storageService.addAssociation(providerId, name, icon);
+ipcMain.handle('add-association', async (_, providerId, name, icon, withDefaultAgendas = true, keywords = []) => {
+  return toResult(async () => storageService.addAssociation(providerId, name, icon, withDefaultAgendas !== false, keywords));
 });
 
-ipcMain.handle('add-agenda', async (_, providerId, associationId, name, category) => {
-  return storageService.addAgenda(providerId, associationId, name, category);
+ipcMain.handle('add-agenda', async (_, providerId, associationId, name, category, keywords = []) => {
+  return toResult(async () => storageService.addAgenda(providerId, associationId, name, category, keywords));
+});
+
+ipcMain.handle('rename-tree-node', async (_, providerId: string, nodeId: string, name: string) => {
+  return toResult(async () => storageService.renameNode(providerId, nodeId, name));
+});
+
+ipcMain.handle('set-node-keywords', async (_, providerId: string, nodeId: string, keywords: string[]) => {
+  return toResult(async () => storageService.setNodeKeywords(providerId, nodeId, keywords));
+});
+
+ipcMain.handle('delete-tree-node', async (_, providerId: string, nodeId: string) => {
+  return toResult(async () => storageService.deleteTreeNode(providerId, nodeId));
+});
+
+// Keyword Tree Sorter mod
+ipcMain.handle('get-tree-sorter', async (_, providerId: string) => {
+  return toResult(async () => treeSorter.getState(providerId));
+});
+
+ipcMain.handle('save-tree-sorter-settings', async (_, providerId: string, settings: Partial<TreeSorterSettings>) => {
+  return toResult(async () => treeSorter.saveSettings(providerId, settings));
+});
+
+ipcMain.handle('run-tree-sorter', async (_, providerId: string, apply: boolean) => {
+  return toResult(async () => treeSorter.run(providerId, apply === true));
+});
+
+ipcMain.handle('clear-tree-sorter', async (_, providerId: string) => {
+  return toResult(async () => treeSorter.clear(providerId));
+});
+
+// "Design my tree with AI": export the mail list (with instructions for the agent), then import its answer
+ipcMain.handle('export-mail-list', async (_, providerId: string) => {
+  return toResult(async () => {
+    const provider = storageService.getProvider(providerId);
+    if (!provider || !win) throw new Error('Account not found.');
+    const stamp = new Date().toISOString().slice(0, 10);
+    const { canceled, filePath } = await dialog.showSaveDialog(win, {
+      title: 'Export mail list for AI analysis',
+      defaultPath: path.join(app.getPath('downloads'), `enclave-mail-${provider.email.replace(/[^\w.-]/g, '_')}-${stamp}.json`),
+      filters: [
+        { name: 'JSON for an AI agent (recommended)', extensions: ['json'] },
+        { name: 'CSV spreadsheet', extensions: ['csv'] },
+      ],
+    });
+    if (canceled || !filePath) return null;
+    const data = buildMailExport(provider.email, storageService.getAllMessages(providerId), storageService.getAssociations(providerId));
+    const body = filePath.toLowerCase().endsWith('.csv') ? toCsv(data) : JSON.stringify(data, null, 2);
+    fs.writeFileSync(filePath, body, 'utf-8');
+    return { filePath, count: data.messages.length };
+  });
+});
+
+ipcMain.handle('import-tree', async (_, providerId: string, mode: unknown) => {
+  return toResult(async () => {
+    if (!storageService.getProvider(providerId) || !win) throw new Error('Account not found.');
+    const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+      title: 'Import a tree (enclave-tree/v1)',
+      properties: ['openFile'],
+      filters: [{ name: 'Tree JSON', extensions: ['json', 'txt', 'md'] }],
+    });
+    if (canceled || filePaths.length === 0) return null;
+    if (fs.statSync(filePaths[0]).size > MAX_IMPORT_BYTES) throw new Error('That file is too large to be a tree.');
+    const branches = parseTreeImport(extractJson(fs.readFileSync(filePaths[0], 'utf-8')));
+    return storageService.importTree(providerId, branches, mode === 'replace' ? 'replace' : 'merge');
+  });
+});
+
+// People view: received mail grouped by sender or domain
+ipcMain.handle('get-sender-groups', async (_, providerId: string, mode: SenderGroupMode) => {
+  return toResult(async () => storageService.getSenderGroups(providerId, mode));
+});
+
+ipcMain.handle('mark-filter-read', async (_, providerId: string, filterId: string) => {
+  return toResult(async () => storageService.markFilterRead(providerId, filterId));
 });
 
 ipcMain.handle('reorder-emails', async (_, providerId, emailIds) => {

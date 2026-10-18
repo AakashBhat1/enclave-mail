@@ -1,12 +1,43 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { ProviderEnclave, Folder, EmailMessage, AssociationNode, AgendaNode } from '../../renderer/types/index';
+import {
+  ProviderEnclave,
+  Folder,
+  EmailMessage,
+  AssociationNode,
+  AgendaNode,
+  SenderGroup,
+  SenderGroupMode,
+  TreeMatch,
+  TreeScanReport,
+  TreeSorterSettings,
+} from '../../renderer/types/index';
 import type { FolderSnapshot, KnownFolder } from './imap-service';
+import { MessageStore, assertSafeId } from './message-store';
+import { groupBySender, isSenderFilter, matchesSenderFilter } from './sender-groups';
+import { DEFAULT_SORTER_SETTINGS, normalizeKeywords, sanitizeSorterSettings } from './tree-classifier';
+import { isReorderableFilter } from '../../renderer/lib/filters';
+import type { ImportedBranch } from './tree-export';
+
+/** 'merge' unions keywords into existing nodes; 'replace' makes the file the source of truth for keywords. */
+export type TreeImportMode = 'merge' | 'replace';
+
+export interface TreeImportSummary {
+  createdBranches: number;
+  createdSubBranches: number;
+  updatedNodes: number;
+  /** Replace mode: existing nodes the file did not mention, whose keywords were removed ("Parent › Child"). */
+  clearedNodes: string[];
+}
 
 const BASE_DIR = path.join(os.homedir(), '.enclavemail');
 export const PROVIDERS_DIR = path.join(BASE_DIR, 'providers');
 const PROVIDERS_FILE = path.join(BASE_DIR, 'providers.json');
+
+const SERVER_FOLDERS = new Set(['inbox', 'sent', 'drafts', 'archive']);
+const MAX_NODE_NAME = 80;
+const MAX_KEYWORDS_PER_NODE = 50;
 
 const DEFAULT_FOLDERS: Folder[] = [
   { id: 'inbox', name: 'Inbox', path: 'INBOX', unreadCount: 0, totalCount: 0, iconName: 'Inbox' },
@@ -16,8 +47,33 @@ const DEFAULT_FOLDERS: Folder[] = [
   { id: 'archive', name: 'Archive', path: 'Archive', unreadCount: 0, totalCount: 0, iconName: 'Archive' },
 ];
 
+/** What the Tree Sorter keeps per account: its settings, the last scan summary, and which branches each email fell into. */
+export interface TreeSorterFile {
+  settings: TreeSorterSettings;
+  lastScan: TreeScanReport | null;
+  matches: Record<string, TreeMatch[]>;
+}
+
+const EMPTY_SORTER: TreeSorterFile = { settings: DEFAULT_SORTER_SETTINGS, lastScan: null, matches: {} };
+
+function newId(prefix: string): string {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function cleanName(name: string): string {
+  const trimmed = typeof name === 'string' ? name.trim().slice(0, MAX_NODE_NAME) : '';
+  if (!trimmed) throw new Error('A name is required.');
+  return trimmed;
+}
+
+function byPositionThenNewest(a: EmailMessage, b: EmailMessage): number {
+  return (a.position ?? Infinity) - (b.position ?? Infinity) || (b.timestamp ?? 0) - (a.timestamp ?? 0);
+}
+
 export class StorageService {
   private baseDir: string;
+  private readonly messages = new MessageStore(PROVIDERS_DIR);
+  private readonly sorterCache = new Map<string, TreeSorterFile>();
 
   constructor() {
     this.baseDir = BASE_DIR;
@@ -25,18 +81,16 @@ export class StorageService {
   }
 
   private ensureBaseDirectories() {
-    if (!fs.existsSync(this.baseDir)) {
-      fs.mkdirSync(this.baseDir, { recursive: true });
-    }
-    const providersDir = path.join(this.baseDir, 'providers');
-    if (!fs.existsSync(providersDir)) {
-      fs.mkdirSync(providersDir, { recursive: true });
-    }
-    const modsDir = path.join(this.baseDir, 'mods');
-    if (!fs.existsSync(modsDir)) {
-      fs.mkdirSync(modsDir, { recursive: true });
+    for (const dir of [this.baseDir, PROVIDERS_DIR, path.join(this.baseDir, 'mods')]) {
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     }
   }
+
+  private providerFile(providerId: string, name: string): string {
+    return path.join(this.messages.providerDir(providerId), name);
+  }
+
+  // ---------- Providers ----------
 
   public getProviders(): ProviderEnclave[] {
     if (!fs.existsSync(PROVIDERS_FILE)) return [];
@@ -52,7 +106,9 @@ export class StorageService {
     // Only ids already on the list are accepted, so a crafted id can never point rm outside the providers dir
     const target = providers.find((p) => p.id === providerId);
     if (!target) throw new Error('Account not found.');
-    fs.rmSync(path.join(PROVIDERS_DIR, target.id), { recursive: true, force: true });
+    fs.rmSync(this.messages.providerDir(target.id), { recursive: true, force: true });
+    this.messages.forget(target.id);
+    this.sorterCache.delete(target.id);
     const remaining = providers.filter((p) => p.id !== target.id);
     fs.writeFileSync(PROVIDERS_FILE, JSON.stringify(remaining, null, 2), 'utf-8');
   }
@@ -63,12 +119,25 @@ export class StorageService {
     return providers.find((p) => p.id === providerId) ?? null;
   }
 
+  public addProvider(newProvider: ProviderEnclave): ProviderEnclave {
+    const providers = this.getProviders();
+    const storagePath = this.messages.providerDir(newProvider.id);
+    fs.mkdirSync(path.join(storagePath, 'attachments'), { recursive: true });
+    fs.writeFileSync(path.join(storagePath, 'folders.json'), JSON.stringify(DEFAULT_FOLDERS, null, 2), 'utf-8');
+    fs.writeFileSync(path.join(storagePath, 'associations.json'), JSON.stringify([], null, 2), 'utf-8');
+    this.messages.write(newProvider.id, []);
+
+    const saved = { ...newProvider, storagePath };
+    fs.writeFileSync(PROVIDERS_FILE, JSON.stringify([...providers, saved], null, 2), 'utf-8');
+    return saved;
+  }
+
+  // ---------- Sync ----------
+
   /** UIDs already cached per folder (ids are `${folderId}_${uidValidity}_${uid}`), so sync can skip re-downloading them. */
   public getKnownFolders(providerId: string): Map<string, KnownFolder> {
-    const mPath = path.join(this.baseDir, 'providers', providerId, 'messages.json');
-    const existing: EmailMessage[] = fs.existsSync(mPath) ? JSON.parse(fs.readFileSync(mPath, 'utf-8')) : [];
     const known = new Map<string, KnownFolder>();
-    for (const m of existing) {
+    for (const m of this.messages.read(providerId)) {
       const [folderId, uidValidity, uid] = m.id.split('_');
       if (!uidValidity || !uid || !/^\d+$/.test(uid)) continue;
       const entry = known.get(folderId);
@@ -79,33 +148,36 @@ export class StorageService {
     return known;
   }
 
-  // Rebuilds server-backed folders from the server window, reusing cached messages and keeping local-only state
+  // Rebuilds server-backed folders from the server's complete UID list, reusing cached messages and keeping local-only state
   public saveSyncedMessages(providerId: string, snapshots: FolderSnapshot[]): void {
-    const provDir = path.join(this.baseDir, 'providers', providerId);
-    const mPath = path.join(provDir, 'messages.json');
-    const existing: EmailMessage[] = fs.existsSync(mPath) ? JSON.parse(fs.readFileSync(mPath, 'utf-8')) : [];
+    const existing = this.messages.read(providerId);
     const previous = new Map(existing.map((m) => [m.id, m]));
-    const syncedFolders = new Set(snapshots.map((s) => s.folder.id));
+    // Local filing follows a letter the server renumbered or moved (same Message-ID, new UID)
+    const previousByMessageId = new Map(existing.filter((m) => m.messageId).map((m) => [m.messageId as string, m]));
+    const syncedFolders = new Set<string>(snapshots.map((s) => s.folder.id));
 
     const fresh = snapshots.flatMap((s) => {
       const downloaded = new Map(s.newMessages.map((m) => [m.id, m]));
-      return s.windowUids.flatMap((uid): EmailMessage[] => {
+      return s.serverUids.flatMap((uid): EmailMessage[] => {
         const id = `${s.folder.id}_${s.uidValidity}_${uid}`;
+        const fetched = downloaded.get(id);
         const old = previous.get(id);
-        const base = downloaded.get(id) ?? old;
+        const base = fetched ?? old;
+        // Not downloaded yet: the history backfill will bring it in
         if (!base) return [];
-        // Read state from the server, but never un-read something the user opened locally
-        const isRead = s.seen[uid] || (old?.isRead ?? false);
-        if (!old) return [{ ...base, isRead }];
+        const carried = old ?? (fetched?.messageId ? previousByMessageId.get(fetched.messageId) : undefined);
+        // Read state from the server (newest window only), but never un-read something the user opened locally
+        const isRead = (s.seen[uid] ?? base.isRead) || (carried?.isRead ?? false);
+        if (!carried) return [{ ...base, isRead }];
         return [
           {
             ...base,
-            associationId: old.associationId,
-            agendaId: old.agendaId,
-            position: old.position,
-            tags: old.tags,
+            associationId: carried.associationId,
+            agendaId: carried.agendaId,
+            position: old?.position,
+            tags: carried.tags,
             isRead,
-            isStarred: old.isStarred,
+            isStarred: carried.isStarred,
           },
         ];
       });
@@ -114,209 +186,149 @@ export class StorageService {
     const serverMessageIds = new Set(fresh.map((m) => m.messageId).filter(Boolean));
     const kept = existing.filter((m) => {
       if (freshIds.has(m.id)) return false;
-      if (!(syncedFolders as Set<string>).has(m.folderId)) return true;
+      if (!syncedFolders.has(m.folderId)) return true;
       // Just-sent copies stay until the server's copy (same Message-ID) shows up
       if (m.id.startsWith('local_sent_')) return !m.messageId || !serverMessageIds.has(m.messageId);
-      // Older mail beyond the fetch window keeps the user's filing instead of silently vanishing
-      return Boolean(m.associationId || m.agendaId || m.position !== undefined || m.isStarred || m.tags.length > 0);
+      // The server list is complete, so anything else missing from it was deleted or moved on the server
+      return false;
     });
-    const all = [...fresh, ...kept];
-    fs.writeFileSync(mPath, JSON.stringify(all, null, 2), 'utf-8');
+    const keptIds = new Set(kept.map((m) => m.id));
+    const removedIds = existing.filter((m) => !freshIds.has(m.id) && !keptIds.has(m.id)).map((m) => m.id);
+    this.messages.removeBodies(providerId, removedIds);
+    this.pruneTreeMatches(providerId, removedIds);
 
-    const folders: Folder[] = DEFAULT_FOLDERS.map((f) => {
-      const snap = snapshots.find((s) => s.folder.id === f.id);
-      const inFolder = all.filter((m) => (f.id === 'starred' ? m.isStarred : m.folderId === f.id));
-      return { ...f, path: snap?.folder.path ?? f.path, totalCount: inFolder.length, unreadCount: inFolder.filter((m) => !m.isRead).length };
-    });
-    fs.writeFileSync(path.join(provDir, 'folders.json'), JSON.stringify(folders, null, 2), 'utf-8');
-    this.updateProvider(providerId, {
-      unreadTotal: folders.find((f) => f.id === 'inbox')?.unreadCount ?? 0,
-      lastSyncedAt: Date.now(),
-      status: 'connected',
-    });
+    const all = this.messages.write(providerId, [...fresh, ...kept]);
+    this.writeFolderCounts(providerId, all, snapshots);
+    this.updateProvider(providerId, { lastSyncedAt: Date.now(), status: 'connected' });
   }
 
-  public addProvider(newProvider: ProviderEnclave): ProviderEnclave {
-    const providers = this.getProviders();
-    newProvider.storagePath = path.join(this.baseDir, 'providers', newProvider.id);
-    fs.mkdirSync(newProvider.storagePath, { recursive: true });
-    fs.mkdirSync(path.join(newProvider.storagePath, 'attachments'), { recursive: true });
+  /** Adds older letters fetched by the history backfill. Returns how many were new. */
+  public appendMessages(providerId: string, incoming: EmailMessage[]): number {
+    // A removed account must stay removed; writing bodies would recreate its folder
+    if (!this.getProvider(providerId)) return 0;
+    const existing = this.messages.read(providerId);
+    const ids = new Set(existing.map((m) => m.id));
+    const added = incoming.filter((m) => !ids.has(m.id));
+    if (added.length === 0) return 0;
+    const all = this.messages.write(providerId, [...existing, ...added]);
+    this.writeFolderCounts(providerId, all);
+    return added.length;
+  }
 
-    fs.writeFileSync(path.join(newProvider.storagePath, 'folders.json'), JSON.stringify(DEFAULT_FOLDERS, null, 2), 'utf-8');
-    fs.writeFileSync(path.join(newProvider.storagePath, 'associations.json'), JSON.stringify([], null, 2), 'utf-8');
-    fs.writeFileSync(path.join(newProvider.storagePath, 'messages.json'), JSON.stringify([], null, 2), 'utf-8');
+  private writeFolderCounts(providerId: string, all: EmailMessage[], snapshots: FolderSnapshot[] = []): void {
+    const current = this.getFolders(providerId);
+    const folders: Folder[] = DEFAULT_FOLDERS.map((f) => {
+      const serverPath = snapshots.find((s) => s.folder.id === f.id)?.folder.path ?? current.find((c) => c.id === f.id)?.path ?? f.path;
+      const inFolder = all.filter((m) => (f.id === 'starred' ? m.isStarred : m.folderId === f.id));
+      return { ...f, path: serverPath, totalCount: inFolder.length, unreadCount: inFolder.filter((m) => !m.isRead).length };
+    });
+    fs.writeFileSync(this.providerFile(providerId, 'folders.json'), JSON.stringify(folders, null, 2), 'utf-8');
+    this.updateProvider(providerId, { unreadTotal: folders.find((f) => f.id === 'inbox')?.unreadCount ?? 0 });
+  }
 
-    providers.push(newProvider);
-    fs.writeFileSync(PROVIDERS_FILE, JSON.stringify(providers, null, 2), 'utf-8');
-    return newProvider;
+  private refreshFolderCounts(providerId: string): void {
+    this.writeFolderCounts(providerId, this.messages.read(providerId));
   }
 
   public getFolders(providerId: string): Folder[] {
-    const fPath = path.join(this.baseDir, 'providers', providerId, 'folders.json');
+    const fPath = this.providerFile(providerId, 'folders.json');
     if (!fs.existsSync(fPath)) return [];
     return JSON.parse(fs.readFileSync(fPath, 'utf-8'));
   }
 
-  public getAssociations(providerId: string): AssociationNode[] {
-    const aPath = path.join(this.baseDir, 'providers', providerId, 'associations.json');
-    if (!fs.existsSync(aPath)) return [];
-    const assocs: AssociationNode[] = JSON.parse(fs.readFileSync(aPath, 'utf-8'));
-    return assocs.sort((a, b) => a.position - b.position);
-  }
+  // ---------- Reading mail ----------
 
-  public reorderAssociations(providerId: string, associationIds: string[]): AssociationNode[] {
-    const aPath = path.join(this.baseDir, 'providers', providerId, 'associations.json');
-    const assocs = this.getAssociations(providerId);
-
-    associationIds.forEach((id, index) => {
-      const match = assocs.find((a) => a.id === id);
-      if (match) {
-        match.position = index + 1;
-      }
-    });
-
-    assocs.sort((a, b) => a.position - b.position);
-    fs.writeFileSync(aPath, JSON.stringify(assocs, null, 2), 'utf-8');
-    return assocs;
+  /** Every message (headers only) for the account; the Tree Sorter scans this. */
+  public getAllMessages(providerId: string): EmailMessage[] {
+    return this.messages.read(providerId);
   }
 
   public getEmails(providerId: string, filterId: string): EmailMessage[] {
-    const mPath = path.join(this.baseDir, 'providers', providerId, 'messages.json');
-    if (!fs.existsSync(mPath)) return [];
-    const all: EmailMessage[] = JSON.parse(fs.readFileSync(mPath, 'utf-8'));
+    const all = this.messages.read(providerId);
+    const { matches } = this.getTreeSorter(providerId);
 
-    let filtered: EmailMessage[] = [];
+    let filtered: EmailMessage[];
     if (filterId === 'starred') {
       filtered = all.filter((m) => m.isStarred);
-    } else if (filterId === 'inbox' || filterId === 'sent' || filterId === 'drafts' || filterId === 'archive') {
+    } else if (SERVER_FOLDERS.has(filterId)) {
       filtered = all.filter((m) => m.folderId === filterId);
+    } else if (isSenderFilter(filterId)) {
+      filtered = all.filter((m) => matchesSenderFilter(m, filterId));
     } else {
-      // Filter by Association or Agenda node ID
-      filtered = all.filter((m) => m.associationId === filterId || m.agendaId === filterId);
+      // An association or agenda node: filed by hand, or auto-filed by the Tree Sorter
+      filtered = all.filter(
+        (m) =>
+          m.associationId === filterId ||
+          m.agendaId === filterId ||
+          (matches[m.id] ?? []).some((t) => t.associationId === filterId || t.agendaId === filterId)
+      );
     }
 
-    // Manually positioned messages first, then newest first
-    return filtered.sort(
-      (a, b) => (a.position ?? Infinity) - (b.position ?? Infinity) || (b.timestamp ?? 0) - (a.timestamp ?? 0)
-    );
+    const sorted = isReorderableFilter(filterId)
+      ? [...filtered].sort(byPositionThenNewest)
+      : [...filtered].sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+    return sorted.map((m) => (matches[m.id] ? { ...m, treeMatches: matches[m.id] } : m));
   }
 
-  public reorderEmails(providerId: string, emailIds: string[]): EmailMessage[] {
-    const mPath = path.join(this.baseDir, 'providers', providerId, 'messages.json');
-    if (!fs.existsSync(mPath)) return [];
-    const all: EmailMessage[] = JSON.parse(fs.readFileSync(mPath, 'utf-8'));
-
-    emailIds.forEach((id, index) => {
-      const msg = all.find((m) => m.id === id);
-      if (msg) {
-        msg.position = index + 1;
-      }
-    });
-
-    fs.writeFileSync(mPath, JSON.stringify(all, null, 2), 'utf-8');
-    return all;
-  }
-
-  public addAssociation(providerId: string, name: string, icon = '📁'): AssociationNode {
-    const aPath = path.join(this.baseDir, 'providers', providerId, 'associations.json');
-    const assocs = this.getAssociations(providerId);
-
-    const newAssoc: AssociationNode = {
-      id: `assoc_${Date.now()}`,
-      providerId,
-      name,
-      icon,
-      position: assocs.length + 1,
-      agendas: [
-        { id: `agenda_${Date.now()}_gen`, name: 'General', category: 'custom', position: 1, unreadCount: 0, totalCount: 0 },
-        { id: `agenda_${Date.now()}_proj`, name: 'Project', category: 'project', position: 2, unreadCount: 0, totalCount: 0 },
-        { id: `agenda_${Date.now()}_fin`, name: 'Financial', category: 'financial', position: 3, unreadCount: 0, totalCount: 0 },
-        { id: `agenda_${Date.now()}_pfin`, name: 'Project Financial', category: 'financial', position: 4, unreadCount: 0, totalCount: 0 },
-      ],
-    };
-
-    assocs.push(newAssoc);
-    fs.writeFileSync(aPath, JSON.stringify(assocs, null, 2), 'utf-8');
-    return newAssoc;
-  }
-
-  public addAgenda(
-    providerId: string,
-    associationId: string,
-    name: string,
-    category: 'project' | 'financial' | 'operations' | 'legal' | 'custom' = 'custom'
-  ): AgendaNode | null {
-    const aPath = path.join(this.baseDir, 'providers', providerId, 'associations.json');
-    const assocs = this.getAssociations(providerId);
-    const assoc = assocs.find((a) => a.id === associationId);
-    if (!assoc) return null;
-
-    const newAgenda: AgendaNode = {
-      id: `agenda_${Date.now()}`,
-      name,
-      category,
-      position: assoc.agendas.length + 1,
-      unreadCount: 0,
-      totalCount: 0,
-    };
-
-    assoc.agendas.push(newAgenda);
-    fs.writeFileSync(aPath, JSON.stringify(assocs, null, 2), 'utf-8');
-    return newAgenda;
+  public getSenderGroups(providerId: string, mode: SenderGroupMode): SenderGroup[] {
+    return groupBySender(this.messages.read(providerId), mode === 'domain' ? 'domain' : 'sender');
   }
 
   public getEmailDetail(providerId: string, emailId: string): EmailMessage | null {
-    const mPath = path.join(this.baseDir, 'providers', providerId, 'messages.json');
-    if (!fs.existsSync(mPath)) return null;
-    const all: EmailMessage[] = JSON.parse(fs.readFileSync(mPath, 'utf-8'));
-    return all.find((m) => m.id === emailId) || null;
+    const header = this.messages.read(providerId).find((m) => m.id === emailId);
+    if (!header) return null;
+    const treeMatches = this.getTreeSorter(providerId).matches[header.id];
+    return { ...header, ...this.messages.readBody(providerId, header.id), ...(treeMatches ? { treeMatches } : {}) };
+  }
+
+  // ---------- Local message state ----------
+
+  private updateMessages(providerId: string, update: (m: EmailMessage) => EmailMessage | null): EmailMessage[] {
+    let changed = false;
+    const all = this.messages.read(providerId).map((m) => {
+      const next = update(m);
+      if (!next || next === m) return m;
+      changed = true;
+      return next;
+    });
+    return changed ? this.messages.write(providerId, all) : all;
   }
 
   public markEmailRead(providerId: string, emailId: string, isRead: boolean) {
-    const mPath = path.join(this.baseDir, 'providers', providerId, 'messages.json');
-    if (!fs.existsSync(mPath)) return;
-    const all: EmailMessage[] = JSON.parse(fs.readFileSync(mPath, 'utf-8'));
-    const msg = all.find((m) => m.id === emailId);
-    if (msg) {
-      msg.isRead = isRead;
-      fs.writeFileSync(mPath, JSON.stringify(all, null, 2), 'utf-8');
-    }
+    this.updateMessages(providerId, (m) => (m.id === emailId && m.isRead !== isRead ? { ...m, isRead } : null));
+    this.refreshFolderCounts(providerId);
+  }
+
+  /** Marks every unread letter behind a filter (folder, sender, domain or tree node) as read. */
+  public markFilterRead(providerId: string, filterId: string): number {
+    const targets = new Set(this.getEmails(providerId, filterId).filter((m) => !m.isRead).map((m) => m.id));
+    if (targets.size === 0) return 0;
+    this.updateMessages(providerId, (m) => (targets.has(m.id) ? { ...m, isRead: true } : null));
+    this.refreshFolderCounts(providerId);
+    return targets.size;
   }
 
   public toggleStar(providerId: string, emailId: string): boolean {
-    const mPath = path.join(this.baseDir, 'providers', providerId, 'messages.json');
-    if (!fs.existsSync(mPath)) return false;
-    const all: EmailMessage[] = JSON.parse(fs.readFileSync(mPath, 'utf-8'));
-    const msg = all.find((m) => m.id === emailId);
-    if (msg) {
-      msg.isStarred = !msg.isStarred;
-      fs.writeFileSync(mPath, JSON.stringify(all, null, 2), 'utf-8');
-      return msg.isStarred;
-    }
-    return false;
+    const all = this.updateMessages(providerId, (m) => (m.id === emailId ? { ...m, isStarred: !m.isStarred } : null));
+    this.refreshFolderCounts(providerId);
+    return all.find((m) => m.id === emailId)?.isStarred ?? false;
+  }
+
+  /** Saves a hand-made order. Only Tree views use it; folders always sort newest first. */
+  public reorderEmails(providerId: string, emailIds: string[]): EmailMessage[] {
+    const rank = new Map(emailIds.map((id, index) => [id, index + 1]));
+    return this.updateMessages(providerId, (m) => (rank.has(m.id) ? { ...m, position: rank.get(m.id) } : null));
   }
 
   public reassignEmailTree(providerId: string, emailId: string, associationId: string, agendaId: string) {
-    const mPath = path.join(this.baseDir, 'providers', providerId, 'messages.json');
-    if (!fs.existsSync(mPath)) return;
-    const all: EmailMessage[] = JSON.parse(fs.readFileSync(mPath, 'utf-8'));
-    const msg = all.find((m) => m.id === emailId);
-    if (msg) {
-      msg.associationId = associationId;
-      msg.agendaId = agendaId;
-      fs.writeFileSync(mPath, JSON.stringify(all, null, 2), 'utf-8');
-    }
+    this.updateMessages(providerId, (m) => (m.id === emailId ? { ...m, associationId, agendaId } : null));
   }
 
   public saveSentEmail(
     provider: ProviderEnclave,
     email: { to: string; subject: string; body: string; html: string; messageId: string }
   ) {
-    const mPath = path.join(this.baseDir, 'providers', provider.id, 'messages.json');
-    if (!fs.existsSync(mPath)) return;
-    const all: EmailMessage[] = JSON.parse(fs.readFileSync(mPath, 'utf-8'));
     const now = new Date();
-
     const sentMessage: EmailMessage = {
       id: `local_sent_${now.getTime()}`,
       providerId: provider.id,
@@ -335,9 +347,270 @@ export class StorageService {
       tags: ['Outbound'],
       attachments: [],
     };
-
-    all.unshift(sentMessage);
-    fs.writeFileSync(mPath, JSON.stringify(all, null, 2), 'utf-8');
+    this.messages.write(provider.id, [sentMessage, ...this.messages.read(provider.id)]);
     return sentMessage;
+  }
+
+  // ---------- Association & agenda tree ----------
+
+  private readAssociations(providerId: string): AssociationNode[] {
+    const aPath = this.providerFile(providerId, 'associations.json');
+    if (!fs.existsSync(aPath)) return [];
+    const assocs: AssociationNode[] = JSON.parse(fs.readFileSync(aPath, 'utf-8'));
+    return [...assocs].sort((a, b) => a.position - b.position);
+  }
+
+  private writeAssociations(providerId: string, assocs: AssociationNode[]): void {
+    // Counts are derived on every read, so they are never persisted
+    const stored = assocs.map(({ unreadCount: _u, totalCount: _t, ...a }) => ({
+      ...a,
+      agendas: a.agendas.map((ag) => ({ ...ag, unreadCount: 0, totalCount: 0 })),
+    }));
+    fs.writeFileSync(this.providerFile(providerId, 'associations.json'), JSON.stringify(stored, null, 2), 'utf-8');
+  }
+
+  /** The tree with live counts: letters filed by hand plus letters the Tree Sorter put there. */
+  public getAssociations(providerId: string): AssociationNode[] {
+    const assocs = this.readAssociations(providerId);
+    const { matches } = this.getTreeSorter(providerId);
+    const total = new Map<string, number>();
+    const unread = new Map<string, number>();
+    const bump = (nodeId: string, isRead: boolean) => {
+      total.set(nodeId, (total.get(nodeId) ?? 0) + 1);
+      if (!isRead) unread.set(nodeId, (unread.get(nodeId) ?? 0) + 1);
+    };
+    for (const m of this.messages.read(providerId)) {
+      const nodes = new Set<string>();
+      if (m.associationId) nodes.add(m.associationId);
+      if (m.agendaId) nodes.add(m.agendaId);
+      for (const t of matches[m.id] ?? []) {
+        nodes.add(t.associationId);
+        if (t.agendaId) nodes.add(t.agendaId);
+      }
+      nodes.forEach((id) => bump(id, m.isRead));
+    }
+    return assocs.map((a) => ({
+      ...a,
+      totalCount: total.get(a.id) ?? 0,
+      unreadCount: unread.get(a.id) ?? 0,
+      agendas: a.agendas.map((ag) => ({ ...ag, totalCount: total.get(ag.id) ?? 0, unreadCount: unread.get(ag.id) ?? 0 })),
+    }));
+  }
+
+  public reorderAssociations(providerId: string, associationIds: string[]): AssociationNode[] {
+    const rank = new Map(associationIds.map((id, index) => [id, index + 1]));
+    const reordered = this.readAssociations(providerId)
+      .map((a) => (rank.has(a.id) ? { ...a, position: rank.get(a.id) as number } : a))
+      .sort((a, b) => a.position - b.position);
+    this.writeAssociations(providerId, reordered);
+    return this.getAssociations(providerId);
+  }
+
+  public addAssociation(providerId: string, name: string, icon = '📁', withDefaultAgendas = true, keywords: string[] = []): AssociationNode {
+    const assocs = this.readAssociations(providerId);
+    const agenda = (label: string, category: AgendaNode['category'], position: number): AgendaNode => ({
+      id: newId('agenda'),
+      name: label,
+      category,
+      position,
+      unreadCount: 0,
+      totalCount: 0,
+    });
+    const newAssoc: AssociationNode = {
+      id: newId('assoc'),
+      providerId,
+      name: cleanName(name),
+      icon,
+      position: assocs.length + 1,
+      keywords: normalizeKeywords(keywords).slice(0, MAX_KEYWORDS_PER_NODE),
+      agendas: withDefaultAgendas
+        ? [agenda('General', 'custom', 1), agenda('Project', 'project', 2), agenda('Financial', 'financial', 3), agenda('Project Financial', 'financial', 4)]
+        : [],
+    };
+    this.writeAssociations(providerId, [...assocs, newAssoc]);
+    return newAssoc;
+  }
+
+  public addAgenda(
+    providerId: string,
+    associationId: string,
+    name: string,
+    category: 'project' | 'financial' | 'operations' | 'legal' | 'custom' = 'custom',
+    keywords: string[] = []
+  ): AgendaNode | null {
+    const assocs = this.readAssociations(providerId);
+    const assoc = assocs.find((a) => a.id === associationId);
+    if (!assoc) return null;
+
+    const newAgenda: AgendaNode = {
+      id: newId('agenda'),
+      name: cleanName(name),
+      category,
+      position: assoc.agendas.length + 1,
+      unreadCount: 0,
+      totalCount: 0,
+      keywords: normalizeKeywords(keywords).slice(0, MAX_KEYWORDS_PER_NODE),
+    };
+    this.writeAssociations(
+      providerId,
+      assocs.map((a) => (a.id === associationId ? { ...a, agendas: [...a.agendas, newAgenda] } : a))
+    );
+    return newAgenda;
+  }
+
+  /** Sets the Tree Sorter keywords on an association or agenda. */
+  public setNodeKeywords(providerId: string, nodeId: string, keywords: string[]): AssociationNode[] {
+    const clean = normalizeKeywords(keywords).slice(0, MAX_KEYWORDS_PER_NODE);
+    const assocs = this.readAssociations(providerId).map((a) =>
+      a.id === nodeId
+        ? { ...a, keywords: clean }
+        : { ...a, agendas: a.agendas.map((ag) => (ag.id === nodeId ? { ...ag, keywords: clean } : ag)) }
+    );
+    this.writeAssociations(providerId, assocs);
+    return this.getAssociations(providerId);
+  }
+
+  /**
+   * Brings an imported tree (e.g. designed by an AI from an export) into the existing one. Branches and
+   * sub-branches are matched by name (case-insensitive); no node is ever deleted, so hand filing survives.
+   * - 'merge': keywords are unioned.
+   * - 'replace': named nodes get exactly the file's keywords, and nodes the file does not mention lose
+   *   theirs (they stay, but stop auto-filing), so stale over-matching keywords cannot linger.
+   */
+  public importTree(providerId: string, branches: ImportedBranch[], mode: TreeImportMode = 'merge'): TreeImportSummary {
+    const sameName = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
+    const clean = (keywords: string[]) => normalizeKeywords(keywords).slice(0, MAX_KEYWORDS_PER_NODE);
+    const merge = (current: string[] | undefined, extra: string[]) => clean(mode === 'replace' ? extra : [...(current ?? []), ...extra]);
+    const summary: TreeImportSummary = { createdBranches: 0, createdSubBranches: 0, updatedNodes: 0, clearedNodes: [] };
+    // Every node the file names or creates; in replace mode everything else is cleared afterwards
+    const touched = new Set<string>();
+
+    const merged = branches.reduce<AssociationNode[]>((assocs, incoming) => {
+      const existing = assocs.find((a) => sameName(a.name, incoming.name));
+      const base: AssociationNode = existing ?? {
+        id: newId('assoc'),
+        providerId,
+        name: cleanName(incoming.name),
+        icon: incoming.icon || '🌿',
+        position: assocs.length + 1,
+        keywords: [],
+        agendas: [],
+      };
+      if (existing) summary.updatedNodes += 1;
+      else summary.createdBranches += 1;
+
+      const agendas = incoming.children.reduce<AgendaNode[]>((list, child) => {
+        const match = list.find((ag) => sameName(ag.name, child.name));
+        if (match) {
+          summary.updatedNodes += 1;
+          touched.add(match.id);
+          return list.map((ag) => (ag === match ? { ...ag, keywords: merge(ag.keywords, child.keywords) } : ag));
+        }
+        summary.createdSubBranches += 1;
+        const created: AgendaNode = {
+          id: newId('agenda'),
+          name: cleanName(child.name),
+          category: child.category,
+          position: list.length + 1,
+          unreadCount: 0,
+          totalCount: 0,
+          keywords: merge([], child.keywords),
+        };
+        touched.add(created.id);
+        return [...list, created];
+      }, base.agendas);
+
+      const next: AssociationNode = { ...base, icon: existing?.icon || base.icon, keywords: merge(base.keywords, incoming.keywords), agendas };
+      touched.add(next.id);
+      return existing ? assocs.map((a) => (a.id === existing.id ? next : a)) : [...assocs, next];
+    }, this.readAssociations(providerId));
+
+    const result = mode === 'replace' ? this.clearUntouched(merged, touched, summary) : merged;
+    this.writeAssociations(providerId, result);
+    return summary;
+  }
+
+  private clearUntouched(assocs: AssociationNode[], touched: Set<string>, summary: TreeImportSummary): AssociationNode[] {
+    const cleared = (label: string, keywords: string[] | undefined): string[] => {
+      if (keywords?.length) summary.clearedNodes.push(label);
+      return [];
+    };
+    return assocs.map((a) => ({
+      ...a,
+      keywords: touched.has(a.id) ? a.keywords : cleared(a.name, a.keywords),
+      agendas: a.agendas.map((ag) => (touched.has(ag.id) ? ag : { ...ag, keywords: cleared(`${a.name} › ${ag.name}`, ag.keywords) })),
+    }));
+  }
+
+  public renameNode(providerId: string, nodeId: string, name: string): AssociationNode[] {
+    const clean = cleanName(name);
+    const assocs = this.readAssociations(providerId).map((a) =>
+      a.id === nodeId ? { ...a, name: clean } : { ...a, agendas: a.agendas.map((ag) => (ag.id === nodeId ? { ...ag, name: clean } : ag)) }
+    );
+    this.writeAssociations(providerId, assocs);
+    return this.getAssociations(providerId);
+  }
+
+  /** Removes an association (with its agendas) or one agenda, and un-files every letter that pointed at it. */
+  public deleteTreeNode(providerId: string, nodeId: string): AssociationNode[] {
+    const assocs = this.readAssociations(providerId);
+    const removedAssoc = assocs.find((a) => a.id === nodeId);
+    const removed = new Set(removedAssoc ? [nodeId, ...removedAssoc.agendas.map((ag) => ag.id)] : [nodeId]);
+    const next = assocs
+      .filter((a) => a.id !== nodeId)
+      .map((a, index) => ({ ...a, position: index + 1, agendas: a.agendas.filter((ag) => ag.id !== nodeId) }));
+    this.writeAssociations(providerId, next);
+
+    this.updateMessages(providerId, (m) => {
+      const dropAssoc = !!m.associationId && removed.has(m.associationId);
+      const dropAgenda = dropAssoc || (!!m.agendaId && removed.has(m.agendaId));
+      if (!dropAssoc && !dropAgenda) return null;
+      return { ...m, associationId: dropAssoc ? undefined : m.associationId, agendaId: undefined };
+    });
+
+    const sorter = this.getTreeSorter(providerId);
+    const matches = Object.fromEntries(
+      Object.entries(sorter.matches)
+        .map(([id, found]) => [id, found.filter((t) => !removed.has(t.associationId) && !(t.agendaId && removed.has(t.agendaId)))] as const)
+        .filter(([, found]) => found.length > 0)
+    );
+    this.saveTreeSorter(providerId, { ...sorter, matches, lastScan: null });
+    return this.getAssociations(providerId);
+  }
+
+  // ---------- Tree Sorter state ----------
+
+  /** Letters gone from the server leave the Tree Sorter index too, so it never grows stale entries. */
+  private pruneTreeMatches(providerId: string, removedIds: string[]): void {
+    const sorter = this.getTreeSorter(providerId);
+    const stale = removedIds.filter((id) => sorter.matches[id]);
+    if (stale.length === 0) return;
+    const gone = new Set(stale);
+    const matches = Object.fromEntries(Object.entries(sorter.matches).filter(([id]) => !gone.has(id)));
+    this.saveTreeSorter(providerId, { ...sorter, matches });
+  }
+
+  public getTreeSorter(providerId: string): TreeSorterFile {
+    const cached = this.sorterCache.get(providerId);
+    if (cached) return cached;
+    const file = this.providerFile(providerId, 'tree-sorter.json');
+    let loaded = EMPTY_SORTER;
+    if (fs.existsSync(file)) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(file, 'utf-8')) as Partial<TreeSorterFile>;
+        loaded = { settings: sanitizeSorterSettings(raw.settings), lastScan: raw.lastScan ?? null, matches: raw.matches ?? {} };
+      } catch (err) {
+        console.error('Tree Sorter state is unreadable, starting fresh:', err instanceof Error ? err.message : err);
+      }
+    }
+    this.sorterCache.set(providerId, loaded);
+    return loaded;
+  }
+
+  public saveTreeSorter(providerId: string, state: TreeSorterFile): TreeSorterFile {
+    assertSafeId(providerId, 'account id');
+    fs.writeFileSync(this.providerFile(providerId, 'tree-sorter.json'), JSON.stringify(state), 'utf-8');
+    this.sorterCache.set(providerId, state);
+    return state;
   }
 }

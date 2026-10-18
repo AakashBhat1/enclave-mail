@@ -1,6 +1,6 @@
 import { useState, type MouseEvent } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { ArrowDown, ArrowUp, Briefcase, ChevronRight, Cog, DollarSign, Folder as FolderIcon, Plus, Shield } from 'lucide-react';
+import { ArrowDown, ArrowUp, Briefcase, ChevronRight, Cog, DollarSign, Folder as FolderIcon, Plus, Shield, Wand2 } from 'lucide-react';
 import { AssociationNode } from '../../types/index';
 import { InlineAddForm } from './InlineAddForm';
 import { EASE_OUT_EXPO, SPRING_SNAPPY, staggerDelay } from '../../lib/motion';
@@ -12,6 +12,7 @@ interface AssociationTreeProps {
   onReorderAssociations: (associationIds: string[]) => void;
   onAddAssociation?: (name: string, icon?: string) => void;
   onAddAgenda?: (associationId: string, name: string, category: string) => void;
+  onOpenTreeSorter?: () => void;
 }
 
 export const CATEGORY_STYLE: Record<string, { icon: typeof Briefcase; tint: string; dot: string }> = {
@@ -33,6 +34,7 @@ export function AssociationTree({
   onReorderAssociations,
   onAddAssociation,
   onAddAgenda,
+  onOpenTreeSorter,
 }: AssociationTreeProps) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({
     assoc_7brd: true,
@@ -60,14 +62,26 @@ export function AssociationTree({
     <div>
       <div className="flex items-center justify-between px-3 pb-2 pt-1">
         <span className="eyebrow">Associations</span>
-        <button
-          type="button"
-          onClick={() => setIsAddingAssoc((v) => !v)}
-          className="group grid size-6 place-items-center rounded-md text-primary transition-colors hover:bg-primary/10"
-          title="Add association"
-        >
-          <Plus className={`size-3.5 transition-transform duration-500 ease-out-expo ${isAddingAssoc ? 'rotate-45' : 'group-hover:rotate-90'}`} />
-        </button>
+        <span className="flex items-center gap-0.5">
+          {onOpenTreeSorter && (
+            <button
+              type="button"
+              onClick={onOpenTreeSorter}
+              className="group grid size-6 place-items-center rounded-md text-sky transition-colors hover:bg-sky/10"
+              title="Keyword Tree Sorter: file mail into branches by keyword"
+            >
+              <Wand2 className="size-3.5 transition-transform duration-500 ease-out-expo group-hover:-rotate-12" />
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setIsAddingAssoc((v) => !v)}
+            className="group grid size-6 place-items-center rounded-md text-primary transition-colors hover:bg-primary/10"
+            title="Add association"
+          >
+            <Plus className={`size-3.5 transition-transform duration-500 ease-out-expo ${isAddingAssoc ? 'rotate-45' : 'group-hover:rotate-90'}`} />
+          </button>
+        </span>
       </div>
 
       <AnimatePresence>
@@ -90,7 +104,8 @@ export function AssociationTree({
           {associations.map((assoc, index) => {
             const isOpen = !!expanded[assoc.id];
             const isActive = activeFilterId === assoc.id;
-            const unread = assoc.agendas.reduce((sum, a) => sum + a.unreadCount, 0);
+            const unread = assoc.unreadCount ?? assoc.agendas.reduce((sum, a) => sum + a.unreadCount, 0);
+            const total = assoc.totalCount ?? 0;
 
             return (
               <motion.div
@@ -119,6 +134,7 @@ export function AssociationTree({
                     <span className="grid size-6 place-items-center rounded-lg bg-sunken text-[13px]">{assoc.icon || '📌'}</span>
                     <span className="truncate text-[13px] font-semibold">{assoc.name}</span>
                     {unread > 0 && !isOpen && <span className="size-1.5 flex-shrink-0 rounded-full bg-primary" />}
+                    {total > 0 && <span className="flex-shrink-0 font-mono text-[10px] text-muted/80 group-hover:hidden">{total}</span>}
                   </div>
 
                   <div className="relative flex items-center gap-0.5 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
@@ -191,8 +207,10 @@ export function AssociationTree({
                                 <Icon className={`size-3.5 flex-shrink-0 ${style.tint}`} />
                                 <span className="truncate">{agenda.name}</span>
                               </span>
-                              {agenda.unreadCount > 0 && (
+                              {agenda.unreadCount > 0 ? (
                                 <span className="relative rounded-full bg-primary px-1.5 text-[10px] font-bold leading-4 text-white">{agenda.unreadCount}</span>
+                              ) : (
+                                agenda.totalCount > 0 && <span className="relative font-mono text-[10px] text-muted/80">{agenda.totalCount}</span>
                               )}
                             </button>
                           );

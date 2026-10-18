@@ -1,13 +1,18 @@
-import { AddAccountInput, MailServerConfig, ProviderEnclave, SendEmailInput, SendOutcome } from '../../renderer/types/index';
+import { AddAccountInput, EmailMessage, MailServerConfig, ProviderEnclave, SendEmailInput, SendOutcome, SyncProgress } from '../../renderer/types/index';
 import { StorageService } from './storage-service';
 import { CredentialStore } from './credential-store';
-import { ImapService } from './imap-service';
+import { BACKFILL_BATCH_SIZE, FolderSnapshot, ImapService, RemoteFolder } from './imap-service';
 import { SmtpService } from './smtp-service';
 import { ImapSessions, type AccountAccess } from './imap-sessions';
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const HOST_PATTERN = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
 const PROVIDER_TYPES = ['gmail', 'outlook', 'custom_imap'];
+// History lands on disk in chunks; rewriting the header file per 40-letter batch would be wasteful
+const BACKFILL_FLUSH_SIZE = 200;
+// While history downloads, the open list refreshes at most this often (each refresh re-sends the open folder)
+const BACKFILL_REFRESH_MS = 12_000;
+const BACKFILL_MAX_RETRIES = 3;
 
 function isPort(value: unknown): value is number {
   return Number.isInteger(value) && (value as number) > 0 && (value as number) <= 65535;
@@ -64,16 +69,39 @@ interface SyncResult {
 
 /** Fired after a background sync (server push, reconnect, startup) so the UI can refresh. */
 export type MailUpdateListener = (providerId: string, newInbox: number) => void;
+export type SyncProgressListener = (progress: SyncProgress) => void;
+
+interface BackfillJob {
+  folder: RemoteFolder;
+  uidValidity: string;
+  uids: number[];
+}
+
+function backfillJobs(snapshots: FolderSnapshot[]): BackfillJob[] {
+  return (
+    snapshots
+      .filter((s) => s.pendingUids.length > 0)
+      .map((s) => ({ folder: s.folder, uidValidity: s.uidValidity, uids: s.pendingUids }))
+      // The inbox is what people scroll first, so its history comes first
+      .sort((a, b) => Number(b.folder.id === 'inbox') - Number(a.folder.id === 'inbox'))
+  );
+}
 
 export class AccountService {
   private readonly sessions: ImapSessions;
   // Overlapping requests for the same account (UI + push + startup) share one sync
   private readonly inflight = new Map<string, Promise<SyncResult>>();
+  private readonly backfilling = new Set<string>();
+  // A sync that found missing history while a backfill was already running; it is re-planned once that ends
+  private readonly backfillRequested = new Set<string>();
 
   constructor(
     private readonly storage: StorageService,
     private readonly credentials: CredentialStore,
-    private readonly onMailUpdate: MailUpdateListener = () => {}
+    private readonly onMailUpdate: MailUpdateListener = () => {},
+    private readonly onProgress: SyncProgressListener = () => {},
+    /** Runs after new mail is stored (e.g. the Tree Sorter's auto-run). */
+    private readonly afterMailStored: (providerId: string) => void = () => {}
   ) {
     this.sessions = new ImapSessions(
       (id) => this.tryLoadAccess(id),
@@ -189,10 +217,104 @@ export class AccountService {
 
     this.sessions.markSynced(provider.id);
     this.storage.saveSyncedMessages(provider.id, snapshots);
+    this.runAfterStore(provider.id);
     const downloaded = snapshots.reduce((n, s) => n + s.newMessages.length, 0);
-    const newInbox = snapshots.find((s) => s.folder.id === 'inbox')?.newMessages.length ?? 0;
-    console.info(`[sync] ${provider.email}: ${downloaded} new message(s) in ${Date.now() - started} ms`);
+    const pending = snapshots.reduce((n, s) => n + s.pendingUids.length, 0);
+    // On the very first sync everything downloaded is history, not news, so it raises no "new letters" toast
+    const newInbox = provider.lastSyncedAt ? snapshots.find((s) => s.folder.id === 'inbox')?.newMessages.length ?? 0 : 0;
+    console.info(`[sync] ${provider.email}: ${downloaded} new message(s), ${pending} older pending, in ${Date.now() - started} ms`);
+    this.startBackfill(provider.id, snapshots);
     return { provider: this.storage.getProvider(provider.id) ?? provider, newInbox };
+  }
+
+  private runAfterStore(providerId: string): void {
+    try {
+      this.afterMailStored(providerId);
+    } catch (err) {
+      console.error('Post-sync hook failed:', err instanceof Error ? err.message : summarizeError(err));
+    }
+  }
+
+  /** Pulls every older letter in the background, newest first, so the first screenful never waits on history. */
+  private startBackfill(providerId: string, snapshots: FolderSnapshot[]): void {
+    const jobs = backfillJobs(snapshots);
+    if (jobs.length === 0) return;
+    if (this.backfilling.has(providerId)) {
+      this.backfillRequested.add(providerId);
+      return;
+    }
+    this.backfilling.add(providerId);
+    void this.runBackfill(providerId, jobs)
+      .catch((err) => console.error('History download stopped:', err instanceof Error ? err.message : summarizeError(err)))
+      .finally(() => {
+        this.backfilling.delete(providerId);
+        // Mail that arrived mid-download may have left new gaps; one more sync plans them
+        if (this.backfillRequested.delete(providerId) && this.sessions.isWatched(providerId)) void this.backgroundSync(providerId);
+      });
+  }
+
+  private async runBackfill(providerId: string, jobs: BackfillJob[]): Promise<void> {
+    const total = jobs.reduce((n, j) => n + j.uids.length, 0);
+    const started = Date.now();
+    let done = 0;
+    let buffered: EmailMessage[] = [];
+    let lastRefresh = Date.now();
+    const stillWanted = () => this.sessions.isWatched(providerId) && this.storage.getProvider(providerId) !== null;
+
+    const flush = (force: boolean) => {
+      if (buffered.length === 0 || (!force && buffered.length < BACKFILL_FLUSH_SIZE)) return;
+      // The account may have been removed while the batch was downloading; never recreate its folder
+      if (!stillWanted()) return;
+      this.storage.appendMessages(providerId, buffered);
+      buffered = [];
+      if (Date.now() - lastRefresh >= BACKFILL_REFRESH_MS) {
+        lastRefresh = Date.now();
+        this.onMailUpdate(providerId, 0);
+      }
+    };
+
+    this.onProgress({ providerId, phase: 'history', done, total, folderId: jobs[0].folder.id });
+    try {
+      for (const job of jobs) {
+        for (let i = 0; i < job.uids.length; i += BACKFILL_BATCH_SIZE) {
+          if (!stillWanted()) return;
+          const batch = job.uids.slice(i, i + BACKFILL_BATCH_SIZE);
+          const messages = await this.fetchBatchWithRetry(providerId, job, batch);
+          // The folder was renumbered mid-way; the next sync plans again from scratch
+          if (messages === null) break;
+          buffered = [...buffered, ...messages];
+          done += batch.length;
+          flush(false);
+          this.onProgress({ providerId, phase: 'history', done, total, folderId: job.folder.id });
+        }
+        flush(true);
+      }
+    } catch (err) {
+      // Keep what already arrived, and let the UI drop its progress bar; the next sync resumes the gap
+      flush(true);
+      if (stillWanted()) this.onProgress({ providerId, phase: 'stopped', done, total });
+      throw err;
+    }
+    if (!stillWanted()) return;
+    // The Tree Sorter's auto-run is a full rescan, so it runs once over the finished history, not per chunk
+    this.runAfterStore(providerId);
+    console.info(`[backfill] ${done}/${total} older message(s) in ${Math.round((Date.now() - started) / 1000)} s`);
+    this.onProgress({ providerId, phase: 'done', done, total });
+    this.onMailUpdate(providerId, 0);
+  }
+
+  private async fetchBatchWithRetry(providerId: string, job: BackfillJob, uids: number[]): Promise<EmailMessage[] | null> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const session = await this.sessions.acquire(providerId);
+        return await ImapService.fetchHistoryBatch(session.client, job.folder, providerId, job.uidValidity, uids);
+      } catch (err) {
+        if (attempt >= BACKFILL_MAX_RETRIES) throw err;
+        // A dropped connection is the usual cause; a fresh login on the next attempt covers it
+        this.sessions.discard(providerId);
+        await new Promise((resolve) => setTimeout(resolve, attempt * 2_000));
+      }
+    }
   }
 
   public async send(input: SendEmailInput): Promise<SendOutcome> {

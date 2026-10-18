@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Download, FileText, FolderTree, Lock, Reply, Sparkles } from 'lucide-react';
+import { Download, FileText, FolderTree, Info, Lock, Reply, Sparkles, Wand2 } from 'lucide-react';
 import DOMPurify from 'dompurify';
 import { EmailMessage, AssociationNode } from '../types/index';
 import { Envelope3D } from './fx/Envelope3D';
@@ -8,6 +8,7 @@ import { Pebble } from './ui/Pebble';
 import { StarButton } from './ui/StarButton';
 import { useToast } from './ui/Toast';
 import { categoryStyle } from './nav/AssociationTree';
+import { autoFiledLabels } from '../lib/auto-filed';
 import { colorFor, initialOf } from '../lib/avatar';
 import { formatFullDate } from '../lib/date';
 import { EASE_OUT_EXPO } from '../lib/motion';
@@ -100,6 +101,7 @@ function Letter({ email, associations, onReply, onTriggerMod, onToggleStar, onOp
   const agenda = assoc?.agendas.find((ag) => ag.id === email.agendaId);
   const sender = email.from.name || email.from.address;
   const words = email.subject.split(' ');
+  const autoBranches = autoFiledLabels(email, associations);
 
   // Sanitize the HTML for safety, stripping scripts and remote tracking pixels
   const sanitizedHtml = useMemo(
@@ -167,6 +169,19 @@ function Letter({ email, associations, onReply, onTriggerMod, onToggleStar, onOp
             </button>
           </motion.div>
 
+          {autoBranches.length > 0 && (
+            <motion.div {...rise(0.08)} className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px] text-muted">
+              <Wand2 className="size-3.5 text-sky" />
+              <span>Auto-filed in</span>
+              {autoBranches.map((branch) => (
+                <span key={branch.key} className="chip border-sky/25 bg-sky/10 text-sky" title={`Matched “${branch.keyword}”`}>
+                  {branch.label}
+                  <span className="font-normal opacity-70">· {branch.keyword}</span>
+                </span>
+              ))}
+            </motion.div>
+          )}
+
           {/* Subject: each word rises out of its own mask */}
           <h1 className="display mt-3 text-[24px] leading-[1.18] text-foreground xl:text-[27px]">
             {words.map((word, i) => (
@@ -223,6 +238,13 @@ function Letter({ email, associations, onReply, onTriggerMod, onToggleStar, onOp
                   <Download className="ml-1 size-3.5 text-muted transition-colors group-hover:text-primary" />
                 </motion.button>
               ))}
+            </motion.div>
+          )}
+
+          {email.bodyTruncated && (
+            <motion.div {...rise(0.3)} className="mt-5 flex items-center gap-2 rounded-xl border border-marigold/30 bg-marigold/10 px-3 py-2 text-[11.5px] text-foreground/80">
+              <Info className="size-3.5 flex-shrink-0 text-marigold" />
+              This is a very large letter from your history, so only its first part was stored. Attachments may be incomplete.
             </motion.div>
           )}
 

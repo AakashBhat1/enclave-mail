@@ -54,6 +54,11 @@ export class ImapSessions {
     session?.client.close();
   }
 
+  /** False once the account was removed or the app is quitting; long-running work checks this to stop. */
+  public isWatched(providerId: string): boolean {
+    return this.watched.has(providerId);
+  }
+
   public markSynced(providerId: string): void {
     const session = this.sessions.get(providerId);
     if (session) session.inboxCount = session.client.mailbox ? session.client.mailbox.exists : session.inboxCount;

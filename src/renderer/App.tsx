@@ -1,8 +1,24 @@
 import React, { useState, useEffect, useRef, type ReactNode } from 'react';
 import { AnimatePresence, MotionConfig, motion } from 'motion/react';
-import { ProviderEnclave, Folder, EmailMessage, ModRule, AssociationNode, AddAccountInput, IpcResult, SendEmailInput, SendOutcome } from './types/index';
+import {
+  ProviderEnclave,
+  Folder,
+  EmailMessage,
+  ModRule,
+  AssociationNode,
+  AddAccountInput,
+  IpcResult,
+  SendEmailInput,
+  SendOutcome,
+  SenderGroup,
+  SenderGroupMode,
+  SyncProgress,
+} from './types/index';
 import { WorkspaceDock } from './components/WorkspaceDock';
-import { AssociationTreeNav } from './components/AssociationTreeNav';
+import { AssociationTreeNav, type NavMode } from './components/AssociationTreeNav';
+import { TreeSorterModal } from './components/sorter/TreeSorterModal';
+import { useSenderGroups } from './lib/use-sender-groups';
+import { isReorderableFilter } from './lib/filters';
 import { MessageList } from './components/MessageList';
 import { ReadingPane } from './components/ReadingPane';
 import { ComposerModal, type SentInfo } from './components/ComposerModal';
@@ -78,6 +94,15 @@ const MailApp: React.FC = () => {
   const [emails, setEmails] = useState<EmailMessage[]>([]);
   const [selectedEmailId, setSelectedEmailId] = useState<string | null>(null);
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [selectedDetail, setSelectedDetail] = useState<EmailMessage | null>(null);
+  const [navMode, setNavMode] = useState<NavMode>('associations');
+  const [senderMode, setSenderMode] = useState<SenderGroupMode>('sender');
+  // Bumped whenever stored mail changes, so derived views (People) reload
+  const [dataVersion, setDataVersion] = useState(0);
+  const [syncProgress, setSyncProgress] = useState<Record<string, SyncProgress>>({});
+  const [isTreeSorterOpen, setIsTreeSorterOpen] = useState(false);
+  const senderGroups = useSenderGroups(activeProviderId, senderMode, navMode === 'people', dataVersion);
+  const bumpData = () => setDataVersion((v) => v + 1);
   const activeProviderIdRef = useRef(activeProviderId);
   const activeFilterIdRef = useRef(activeFilterId);
   const providersRef = useRef(providers);
@@ -153,7 +178,7 @@ const MailApp: React.FC = () => {
         setEmails(msgs);
         if (msgs.length > 0) {
           setSelectedEmailId(msgs[0].id);
-          window.electronAPI.markEmailRead(activeProviderId, msgs[0].id, true);
+          window.electronAPI.markEmailRead(activeProviderId, msgs[0].id, true).then(bumpData);
         } else {
           setSelectedEmailId(null);
         }
@@ -173,17 +198,57 @@ const MailApp: React.FC = () => {
         notify({ tone: 'info', title: newInbox === 1 ? 'New letter' : `${newInbox} new letters`, description: email });
       }
       if (providerId !== activeProviderIdRef.current) return;
-      const [f, msgs] = await Promise.all([
+      const filterId = activeFilterIdRef.current;
+      const [f, msgs, assocs] = await Promise.all([
         window.electronAPI.getFolders(providerId),
-        window.electronAPI.getEmails(providerId, activeFilterIdRef.current),
+        window.electronAPI.getEmails(providerId, filterId),
+        window.electronAPI.getAssociations(providerId),
       ]);
+      // The user may have switched account or folder while this was loading
+      if (providerId !== activeProviderIdRef.current || filterId !== activeFilterIdRef.current) return;
       setFolders(f);
       setEmails(msgs);
+      setAssociations(assocs);
+      bumpData();
     });
   }, [notify]);
 
+  // 5. History download progress (older mail arriving in the background after an account is added)
+  useEffect(() => {
+    if (!window.electronAPI?.onSyncProgress) return;
+    return window.electronAPI.onSyncProgress((progress: SyncProgress) => {
+      setSyncProgress((prev) => ({ ...prev, [progress.providerId]: progress }));
+      const email = providersRef.current.find((p) => p.id === progress.providerId)?.email ?? '';
+      if (progress.phase === 'done' && progress.total > 0) {
+        notify({ tone: 'success', title: 'All your mail is here', description: `${progress.done.toLocaleString()} older letters downloaded for ${email}.` });
+      } else if (progress.phase === 'stopped') {
+        notify({ tone: 'info', title: 'History download paused', description: `${email}: the connection dropped. It picks up again on the next sync.` });
+      }
+    });
+  }, [notify]);
+
+  // 6. Lists carry headers only; the body of the open letter is fetched on its own
+  useEffect(() => {
+    if (!window.electronAPI || !activeProviderId || !selectedEmailId) {
+      setSelectedDetail(null);
+      return;
+    }
+    let cancelled = false;
+    window.electronAPI.getEmailDetail(activeProviderId, selectedEmailId).then((detail: EmailMessage | null) => {
+      if (!cancelled) setSelectedDetail(detail);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProviderId, selectedEmailId]);
+
   const activeProvider = providers.find((p) => p.id === activeProviderId) || null;
-  const selectedEmail = emails.find((e) => e.id === selectedEmailId) || null;
+  const listedEmail = emails.find((e) => e.id === selectedEmailId) || null;
+  // Live state (read, star, filing) comes from the list; the body comes from the detail fetch
+  const selectedEmail =
+    listedEmail && selectedDetail?.id === listedEmail.id
+      ? { ...listedEmail, bodyText: selectedDetail.bodyText, bodyHtml: selectedDetail.bodyHtml }
+      : listedEmail;
 
   // Handlers
   const handleSelectFilter = (filterId: string, label: string) => {
@@ -198,7 +263,33 @@ const MailApp: React.FC = () => {
       setEmails((prev) =>
         prev.map((m) => (m.id === id ? { ...m, isRead: true } : m))
       );
+      bumpData();
     }
+  };
+
+  /** Reloads everything filing can change: the open list, folder counts and tree counts. */
+  const refreshMailViews = async () => {
+    if (!window.electronAPI || !activeProviderId) return;
+    const [f, msgs, assocs] = await Promise.all([
+      window.electronAPI.getFolders(activeProviderId),
+      window.electronAPI.getEmails(activeProviderId, activeFilterIdRef.current),
+      window.electronAPI.getAssociations(activeProviderId),
+    ]);
+    setFolders(f);
+    setEmails(msgs);
+    setAssociations(assocs);
+    bumpData();
+  };
+
+  const handleMarkSenderRead = async (group: SenderGroup) => {
+    if (!window.electronAPI) return;
+    const res: IpcResult<number> = await window.electronAPI.markFilterRead(activeProviderId, group.id);
+    if (!res.success) {
+      notify({ tone: 'error', title: 'Could not mark as read', description: res.error });
+      return;
+    }
+    await refreshMailViews();
+    notify({ tone: 'success', title: `${res.data ?? 0} marked as read`, description: group.label });
   };
 
   const handleToggleStar = async (id: string, e?: React.MouseEvent) => {
@@ -409,10 +500,19 @@ const MailApp: React.FC = () => {
             folders={folders}
             associations={associations}
             activeFilterId={activeFilterId}
+            navMode={navMode}
+            onNavModeChange={setNavMode}
+            senderGroups={senderGroups}
+            senderMode={senderMode}
+            onSenderModeChange={setSenderMode}
+            onMarkSenderRead={handleMarkSenderRead}
+            onComposeTo={(address) => openComposer(address, '')}
+            syncProgress={syncProgress[activeProviderId] ?? null}
             onSelectFilter={handleSelectFilter}
             onReorderAssociations={handleReorderAssociations}
             onAddAssociation={handleAddAssociation}
             onAddAgenda={handleAddAgenda}
+            onOpenTreeSorter={() => setIsTreeSorterOpen(true)}
             onOpenComposer={() => openComposer('', '')}
             onSync={handleSync}
             isSyncing={isSyncing}
@@ -433,6 +533,7 @@ const MailApp: React.FC = () => {
             onToggleStar={handleToggleStar}
             onSelectFolder={(id) => handleSelectFilter(id, id.charAt(0).toUpperCase() + id.slice(1))}
             onReorderEmails={handleReorderEmails}
+            canReorder={isReorderableFilter(activeFilterId)}
             onOpenTreeMove={openTreeMove}
           />
         </PaneEntrance>
@@ -470,6 +571,19 @@ const MailApp: React.FC = () => {
         mods={mods}
         onToggleMod={handleToggleMod}
         onAddMod={handleAddMod}
+        onOpenTreeSorter={() => {
+          setIsModsOpen(false);
+          setIsTreeSorterOpen(true);
+        }}
+      />
+
+      <TreeSorterModal
+        isOpen={isTreeSorterOpen && !!activeProviderId}
+        onClose={() => setIsTreeSorterOpen(false)}
+        providerId={activeProviderId}
+        associations={associations}
+        onTreeChanged={setAssociations}
+        onFiled={() => void refreshMailViews()}
       />
 
       <AddAccountModal

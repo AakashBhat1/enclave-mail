@@ -14,6 +14,7 @@ export interface AgendaNode {
   position: number;
   unreadCount: number;
   totalCount: number;
+  keywords?: string[]; // Tree Sorter keywords; a leading "-" excludes
 }
 
 export interface AssociationNode {
@@ -23,6 +24,84 @@ export interface AssociationNode {
   position: number; // Custom user-defined position rank
   icon?: string;
   agendas: AgendaNode[];
+  keywords?: string[]; // Tree Sorter keywords; a leading "-" excludes (also applies to every agenda below)
+  unreadCount?: number;
+  totalCount?: number;
+}
+
+/** One branch an email was auto-filed into by the Tree Sorter, and the keyword that put it there. */
+export interface TreeMatch {
+  associationId: string;
+  agendaId?: string;
+  keyword: string;
+}
+
+export type TreeSorterField = 'subject' | 'from' | 'snippet';
+
+export interface TreeSorterSettings {
+  folders: string[];
+  fields: TreeSorterField[];
+  /** 'word' matches at the start of a word ("invoice" hits "Invoices"); 'anywhere' is a plain substring. */
+  matchMode: 'word' | 'anywhere';
+  /** Re-file automatically after every sync. */
+  autoRun: boolean;
+}
+
+export interface TreeScanNodeResult {
+  associationId: string;
+  agendaId?: string;
+  count: number;
+  unread: number;
+  samples: string[];
+}
+
+export interface TreeScanReport {
+  scanned: number;
+  matched: number;
+  /** Emails filed into more than one branch. */
+  multiBranch: number;
+  unmatched: number;
+  nodes: TreeScanNodeResult[];
+  applied: boolean;
+  scannedAt: number;
+}
+
+export interface KeywordSuggestion {
+  keyword: string;
+  /** How many scanned subjects mention it. */
+  count: number;
+}
+
+export interface TreeSorterState {
+  settings: TreeSorterSettings;
+  lastScan: TreeScanReport | null;
+  /** Frequent subject words not yet used anywhere in the tree. */
+  suggestions: KeywordSuggestion[];
+}
+
+export type SenderGroupMode = 'sender' | 'domain';
+
+export interface SenderGroup {
+  /** Filter id for getEmails, e.g. "sender:ana@acme.com" or "domain:acme.com". */
+  id: string;
+  label: string;
+  address: string;
+  count: number;
+  unread: number;
+  starred: number;
+  latestTimestamp: number;
+  latestSubject: string;
+  /** Distinct senders inside a domain group. */
+  members: number;
+}
+
+export interface SyncProgress {
+  providerId: string;
+  /** 'history' while older mail is still downloading, 'done' once everything is local, 'stopped' after a failure (the next sync resumes). */
+  phase: 'history' | 'done' | 'stopped';
+  done: number;
+  total: number;
+  folderId?: string;
 }
 
 export interface EmailMessage {
@@ -46,12 +125,16 @@ export interface EmailMessage {
   uid?: number; // IMAP UID within the server mailbox
   messageId?: string; // RFC 5322 Message-ID, used to match local sent copies to server copies
   snippet: string;
-  bodyText?: string;
+  bodyText?: string; // Only on getEmailDetail; lists carry headers only
   bodyHtml?: string;
+  /** Very large letters are stored partially during history download. */
+  bodyTruncated?: boolean;
   isRead: boolean;
   isStarred: boolean;
   tags: string[];
   attachments: Attachment[];
+  /** Tree Sorter branches, attached when read (not stored on the message). */
+  treeMatches?: TreeMatch[];
 }
 
 export interface Folder {

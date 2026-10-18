@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Plus, Sliders, Terminal } from 'lucide-react';
+import { ArrowRight, Plus, Sliders, Terminal, Wand2 } from 'lucide-react';
 import { ModRule } from '../types/index';
 import { Modal, ModalHeader } from './ui/Modal';
 import { EASE_OUT_EXPO, SPRING_SNAPPY, staggerDelay } from '../lib/motion';
@@ -11,6 +11,7 @@ interface ModManagerModalProps {
   mods: ModRule[];
   onToggleMod: (id: string) => void;
   onAddMod: (rule: ModRule) => void;
+  onOpenTreeSorter: () => void;
 }
 
 function Toggle({ on, onClick, label }: { on: boolean; onClick: () => void; label: string }) {
@@ -28,7 +29,7 @@ function Toggle({ on, onClick, label }: { on: boolean; onClick: () => void; labe
   );
 }
 
-export function ModManagerModal({ isOpen, onClose, mods, onToggleMod, onAddMod }: ModManagerModalProps) {
+export function ModManagerModal({ isOpen, onClose, mods, onToggleMod, onAddMod, onOpenTreeSorter }: ModManagerModalProps) {
   const [newRuleName, setNewRuleName] = useState('');
   const [keyword, setKeyword] = useState('');
   const [tag, setTag] = useState('');
@@ -60,7 +61,24 @@ export function ModManagerModal({ isOpen, onClose, mods, onToggleMod, onAddMod }
       </div>
 
       <div className="flex-1 space-y-2.5 overflow-y-auto px-6 pb-6 pt-5">
-        <div className="eyebrow">Active rules</div>
+        <div className="eyebrow">Built-in mods</div>
+        <motion.button
+          type="button"
+          onClick={onOpenTreeSorter}
+          whileHover={{ y: -2 }}
+          className="card group flex w-full items-center gap-3.5 border-sky/25 p-4 text-left"
+        >
+          <span className="grid size-10 flex-shrink-0 place-items-center rounded-xl bg-sky/10 text-sky">
+            <Wand2 className="size-5" />
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block text-sm font-semibold text-foreground">Keyword Tree Sorter</span>
+            <span className="block text-xs text-muted">Put keywords on your tree’s branches, then scan and file mail into every branch it matches.</span>
+          </span>
+          <ArrowRight className="size-4 flex-shrink-0 text-muted transition-transform duration-300 group-hover:translate-x-1 group-hover:text-sky" />
+        </motion.button>
+
+        <div className="eyebrow pt-2">Active rules</div>
         <AnimatePresence initial={false}>
           {mods.map((mod, index) => (
             <motion.div

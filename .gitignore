@@ -23,3 +23,6 @@ pnpm-debug.log*
 .idea/
 .DS_Store
 Thumbs.db
+
+# Mail exports and AI-made trees (real mail data, never commit)
+etspl/
