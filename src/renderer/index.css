@@ -1,0 +1,345 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---------- Tokens (palette shared with the resume site) ---------- */
+:root {
+  color-scheme: light;
+  --background: 251 246 238; /* #FBF6EE warm cream */
+  --surface: 255 253 248; /* #FFFDF8 paper */
+  --sunken: 245 237 225; /* #F5EDE1 pressed paper */
+  --foreground: 43 30 22; /* #2B1E16 bark ink */
+  --muted: 120 99 83; /* #786353 */
+  --border: 230 217 198; /* #E6D9C6 */
+  --primary: 196 84 28; /* #C4541C burnt pumpkin */
+  --primary-hover: 175 71 20;
+  --primary-soft: 250 226 207; /* #FAE2CF */
+  --marigold: 227 163 58; /* #E3A33A */
+  --cranberry: 142 47 54; /* #8E2F36 */
+  --moss: 95 107 58; /* #5F6B3A */
+  --sky: 63 108 115; /* #3F6C73 deep teal, the one cool accent */
+  --shadow: 43 30 22;
+  --shadow-glow: 120 60 20;
+  --spot: 255 236 210;
+  --pane-alpha: 0.74;
+
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+}
+
+
+.dark {
+  color-scheme: dark;
+  --background: 26 20 17; /* #1A1411 espresso */
+  --surface: 38 29 24;
+  --sunken: 30 23 19;
+  --foreground: 243 232 218;
+  --muted: 176 156 139;
+  --border: 66 51 41;
+  --primary: 224 122 63;
+  --primary-hover: 240 138 79;
+  --primary-soft: 74 42 25;
+  --marigold: 240 185 85;
+  --cranberry: 214 98 106;
+  --moss: 164 176 112;
+  --sky: 118 170 178;
+  --shadow: 0 0 0;
+  --shadow-glow: 0 0 0;
+  --spot: 255 170 110;
+  --pane-alpha: 0.7;
+}
+
+* {
+  @apply border-border;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  user-select: none;
+  @apply bg-background font-sans text-foreground antialiased;
+  font-feature-settings: 'rlig' 1, 'calt' 1, 'ss01' 1;
+}
+
+*:focus-visible {
+  outline: 2px solid rgb(var(--primary));
+  outline-offset: 2px;
+}
+
+/* Text fields draw their own focus (ring or underline), so the generic outline would double up */
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: none;
+}
+
+::selection {
+  background-color: rgb(var(--marigold) / 0.4);
+  color: rgb(var(--foreground));
+}
+
+input,
+textarea,
+[contenteditable] {
+  user-select: text;
+}
+
+/* ---------- Scrollbars ---------- */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--muted) / 0.22);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(var(--muted) / 0.4);
+}
+
+@layer components {
+  /* Frosted paper: the ambient light shows through */
+  .pane {
+    position: relative;
+    border-radius: 18px;
+    background: rgb(var(--surface) / var(--pane-alpha));
+    backdrop-filter: blur(26px) saturate(1.35);
+    @apply shadow-pane;
+  }
+
+  .dark .pane {
+    box-shadow:
+      0 1px 0 rgb(255 255 255 / 0.04) inset,
+      0 0 0 1px rgb(var(--border) / 0.8),
+      0 18px 50px -24px rgb(0 0 0 / 0.6);
+  }
+
+  .card {
+    @apply rounded-2xl border border-border/80 bg-surface shadow-warm;
+  }
+
+  .eyebrow {
+    @apply text-[10.5px] font-semibold uppercase tracking-[0.2em] text-muted;
+  }
+
+  .display {
+    @apply font-serif font-medium tracking-[-0.02em];
+    font-variation-settings: 'SOFT' 100, 'WONK' 1;
+  }
+
+  .field {
+    @apply w-full rounded-xl border border-border bg-surface/80 px-3.5 py-2.5 text-sm text-foreground outline-none transition duration-200 placeholder:text-muted/60 focus:border-primary/70 focus:bg-surface focus:ring-4 focus:ring-primary/10;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2 text-xs font-semibold transition-all duration-300 ease-out-expo disabled:pointer-events-none disabled:opacity-50;
+  }
+
+  /* Glossy pumpkin pill with a light sweep on hover */
+  .btn-primary {
+    @apply btn relative overflow-hidden text-white;
+    background: linear-gradient(180deg, rgb(var(--primary-hover) / 0.0), rgb(var(--primary-hover) / 0.35)),
+      rgb(var(--primary));
+    box-shadow:
+      0 1px 0 rgb(255 255 255 / 0.28) inset,
+      0 -2px 0 rgb(0 0 0 / 0.12) inset,
+      0 8px 20px -8px rgb(var(--primary) / 0.65);
+  }
+  .btn-primary::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(105deg, transparent 30%, rgb(255 255 255 / 0.35) 50%, transparent 70%);
+    transform: translateX(-120%);
+    transition: transform 900ms var(--ease-out-expo);
+  }
+  .btn-primary:hover::after {
+    transform: translateX(120%);
+  }
+  .btn-primary:hover {
+    transform: translateY(-1px);
+    box-shadow:
+      0 1px 0 rgb(255 255 255 / 0.3) inset,
+      0 -2px 0 rgb(0 0 0 / 0.12) inset,
+      0 14px 26px -10px rgb(var(--primary) / 0.7);
+  }
+  .btn-primary:active {
+    transform: translateY(0) scale(0.98);
+  }
+
+  .btn-ghost {
+    @apply btn text-muted hover:bg-sunken hover:text-foreground;
+  }
+
+  .btn-soft {
+    @apply btn border border-border bg-surface/70 text-foreground hover:border-primary/40 hover:text-primary;
+  }
+
+  .icon-btn {
+    @apply inline-flex size-8 items-center justify-center rounded-lg text-muted transition-colors duration-200 hover:bg-sunken hover:text-foreground;
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10.5px] font-semibold;
+  }
+
+  /* Underline that draws in from the left on hover (from the resume site) */
+  .link-draw {
+    background-image: linear-gradient(currentColor, currentColor);
+    background-size: 0% 1px;
+    background-position: 0 100%;
+    background-repeat: no-repeat;
+    transition: background-size 450ms var(--ease-out-expo), color 200ms ease;
+  }
+  .link-draw:hover {
+    background-size: 100% 1px;
+  }
+}
+
+/* ---------- Paper grain over everything ---------- */
+.grain::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  pointer-events: none;
+  opacity: 0.06;
+  mix-blend-mode: multiply;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 220 220' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+.dark .grain::after {
+  mix-blend-mode: soft-light;
+  opacity: 0.12;
+}
+
+/* ---------- Keyframes ---------- */
+@keyframes word-rise {
+  from {
+    transform: translate3d(0, 110%, 0) rotate(4deg);
+  }
+}
+.word-rise {
+  display: inline-block;
+  animation: word-rise 0.9s var(--ease-out-expo) both;
+}
+
+@keyframes shimmer {
+  to {
+    transform: translateX(100%);
+  }
+}
+.shimmer {
+  position: relative;
+  overflow: hidden;
+  background: rgb(var(--border) / 0.7);
+}
+.shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgb(var(--spot) / 0.75), transparent);
+  animation: shimmer 1.6s var(--ease-in-out) infinite;
+}
+.dark .shimmer::after {
+  background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.06), transparent);
+}
+
+/* Light sweep along the top edge while a sync is in flight */
+@keyframes sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(250%);
+  }
+}
+.sync-sweep {
+  animation: sweep 1.4s var(--ease-in-out) infinite;
+}
+
+@keyframes float-y {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-8px);
+  }
+}
+.float-y {
+  animation: float-y 6s var(--ease-in-out) infinite;
+}
+
+@keyframes draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+.draw-check {
+  stroke-dasharray: 24;
+  stroke-dashoffset: 24;
+  animation: draw 0.6s var(--ease-out-expo) 0.15s forwards;
+}
+
+@keyframes eq {
+  0%,
+  100% {
+    transform: scaleY(0.35);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+.eq-bar {
+  transform-origin: 50% 100%;
+  animation: eq 0.9s var(--ease-in-out) infinite;
+}
+
+/* ---------- Theme toggle: circular reveal from the click point ---------- */
+html.theme-vt::view-transition-old(root),
+html.theme-vt::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+html.theme-vt::view-transition-new(root) {
+  animation: theme-reveal 750ms var(--ease-out-expo);
+}
+@keyframes theme-reveal {
+  from {
+    clip-path: circle(0 at var(--vt-x, 50%) var(--vt-y, 0%));
+  }
+  to {
+    clip-path: circle(150vmax at var(--vt-x, 50%) var(--vt-y, 0%));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation: none !important;
+  }
+  .word-rise,
+  .shimmer::after,
+  .sync-sweep,
+  .float-y,
+  .eq-bar {
+    animation: none !important;
+  }
+  .draw-check {
+    animation: none;
+    stroke-dashoffset: 0;
+  }
+}

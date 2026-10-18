@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+.venv/
+
+# Build output
+dist/
+dist-electron/
+release/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Environment / secrets (account passwords live in ~/.enclavemail, never in the repo)
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
