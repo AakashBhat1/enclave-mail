@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { EmailMessage } from '../../renderer/types/index';
+import { readJsonSafe, writeJsonAtomic } from './atomic-file';
 
 // Ids become file and folder names, so anything that could climb out of the providers dir is refused
 const SAFE_ID = /^[\w-]{1,128}$/;
@@ -19,6 +20,18 @@ interface CacheEntry {
   mtimeMs: number;
   size: number;
   messages: EmailMessage[];
+}
+
+function isMessageList(value: unknown): value is EmailMessage[] {
+  return Array.isArray(value) && value.every((m) => typeof m === 'object' && m !== null && typeof (m as EmailMessage).id === 'string');
+}
+
+function statOrNull(file: string): fs.Stats | null {
+  try {
+    return fs.statSync(file);
+  } catch {
+    return null;
+  }
 }
 
 function stripBody(message: EmailMessage): { header: EmailMessage; body: StoredBody | null } {
@@ -55,16 +68,17 @@ export class MessageStore {
 
   public read(providerId: string): EmailMessage[] {
     const file = this.messagesPath(providerId);
-    if (!fs.existsSync(file)) return [];
-    const { mtimeMs, size } = fs.statSync(file);
+    const before = statOrNull(file);
     const cached = this.cache.get(providerId);
     // Size as well as mtime: two writes inside one clock tick would otherwise look unchanged
-    if (cached && cached.mtimeMs === mtimeMs && cached.size === size) return cached.messages;
+    if (before && cached && cached.mtimeMs === before.mtimeMs && cached.size === before.size) return cached.messages;
 
-    const parsed: EmailMessage[] = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    // A damaged file falls back to its backup (or to empty, which the next sync refills) instead of throwing
+    const parsed = readJsonSafe<EmailMessage[]>(file, [], isMessageList);
     // Older versions kept bodies inline; move them out once so every later read stays small
     if (parsed.some((m) => m.bodyText !== undefined || m.bodyHtml !== undefined)) return this.write(providerId, parsed);
-    this.cache.set(providerId, { mtimeMs, size, messages: parsed });
+    const after = statOrNull(file);
+    if (after) this.cache.set(providerId, { mtimeMs: after.mtimeMs, size: after.size, messages: parsed });
     return parsed;
   }
 
@@ -76,7 +90,7 @@ export class MessageStore {
       return header;
     });
     const file = this.messagesPath(providerId);
-    fs.writeFileSync(file, JSON.stringify(headers), 'utf-8');
+    writeJsonAtomic(file, headers);
     const stat = fs.statSync(file);
     this.cache.set(providerId, { mtimeMs: stat.mtimeMs, size: stat.size, messages: headers });
     return headers;
@@ -94,8 +108,8 @@ export class MessageStore {
   }
 
   private writeBody(providerId: string, messageId: string, body: StoredBody): void {
-    fs.mkdirSync(this.bodiesDir(providerId), { recursive: true });
-    fs.writeFileSync(this.bodyPath(providerId, messageId), JSON.stringify(body), 'utf-8');
+    // One file per letter and downloadable again, so no backup copy
+    writeJsonAtomic(this.bodyPath(providerId, messageId), body, { backup: false });
   }
 
   public removeBodies(providerId: string, messageIds: string[]): void {

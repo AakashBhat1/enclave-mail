@@ -12,6 +12,7 @@ import {
   SendOutcome,
   SenderGroup,
   SenderGroupMode,
+  StorageRecoveryNotice,
   SyncProgress,
 } from './types/index';
 import { WorkspaceDock } from './components/WorkspaceDock';
@@ -20,6 +21,7 @@ import { TreeSorterModal } from './components/sorter/TreeSorterModal';
 import { useSenderGroups } from './lib/use-sender-groups';
 import { isReorderableFilter } from './lib/filters';
 import { errorMessage, unwrap } from './lib/ipc';
+import { recoveryToast } from './lib/storage-recovery';
 import { MessageList } from './components/MessageList';
 import { ReadingPane } from './components/ReadingPane';
 import { ComposerModal, type SentInfo } from './components/ComposerModal';
@@ -230,6 +232,19 @@ const MailApp: React.FC = () => {
         notify({ tone: 'info', title: 'History download paused', description: `${email}: the connection dropped. It picks up again on the next sync.` });
       }
     });
+  }, [notify]);
+
+  // 5b. Damaged data files the main process repaired, often at startup before this window existed
+  useEffect(() => {
+    if (!window.electronAPI?.takeStorageRecoveries) return;
+    const show = () => {
+      window.electronAPI
+        .takeStorageRecoveries()
+        .then((notices: StorageRecoveryNotice[]) => notices.forEach((notice) => notify(recoveryToast(notice))))
+        .catch((err: unknown) => console.error('Could not read storage recoveries:', errorMessage(err)));
+    };
+    show();
+    return window.electronAPI.onStorageRecovered(show);
   }, [notify]);
 
   // 6. Lists carry headers only; the body of the open letter is fetched on its own

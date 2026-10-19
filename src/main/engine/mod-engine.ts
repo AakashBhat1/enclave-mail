@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { ModRule, EmailMessage } from '../../renderer/types/index';
+import { isJsonArray, readJsonSafe, writeJsonAtomic } from './atomic-file';
 
 const BASE_DIR = path.join(os.homedir(), '.enclavemail');
 const MODS_FILE = path.join(BASE_DIR, 'mods', 'rules.json');
@@ -64,13 +65,12 @@ export class ModEngine {
           },
         },
       ];
-      fs.writeFileSync(MODS_FILE, JSON.stringify(defaultRules, null, 2), 'utf-8');
+      writeJsonAtomic(MODS_FILE, defaultRules, { space: 2 });
     }
   }
 
   public getRules(): ModRule[] {
-    if (!fs.existsSync(MODS_FILE)) return [];
-    return JSON.parse(fs.readFileSync(MODS_FILE, 'utf-8'));
+    return readJsonSafe<ModRule[]>(MODS_FILE, [], isJsonArray);
   }
 
   public toggleRule(ruleId: string): boolean {
@@ -78,7 +78,7 @@ export class ModEngine {
     const r = rules.find((x) => x.id === ruleId);
     if (r) {
       r.enabled = !r.enabled;
-      fs.writeFileSync(MODS_FILE, JSON.stringify(rules, null, 2), 'utf-8');
+      writeJsonAtomic(MODS_FILE, rules, { space: 2 });
       return r.enabled;
     }
     return false;
@@ -92,7 +92,7 @@ export class ModEngine {
     } else {
       rules.push(rule);
     }
-    fs.writeFileSync(MODS_FILE, JSON.stringify(rules, null, 2), 'utf-8');
+    writeJsonAtomic(MODS_FILE, rules, { space: 2 });
     return rule;
   }
 

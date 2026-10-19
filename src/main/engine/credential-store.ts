@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { safeStorage } from 'electron';
+import { writeFileAtomic } from './atomic-file';
 
 const CREDENTIAL_FILE = 'credentials.bin';
 
@@ -13,8 +14,8 @@ export class CredentialStore {
       throw new Error('OS encryption is unavailable, refusing to store the password in plain text.');
     }
     const dir = path.join(this.providersDir, providerId);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, CREDENTIAL_FILE), safeStorage.encryptString(password));
+    // A torn write would lose the password for good, so it is replaced in one step
+    writeFileAtomic(path.join(dir, CREDENTIAL_FILE), safeStorage.encryptString(password), { backup: false });
   }
 
   public getPassword(providerId: string): string {

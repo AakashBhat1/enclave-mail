@@ -58,6 +58,14 @@ export const electronAPI = {
     return () => ipcRenderer.removeListener('sync-progress', handler);
   },
 
+  // Damaged data files the main process repaired. The event is only a nudge to take them, so none shows twice
+  takeStorageRecoveries: () => ipcRenderer.invoke('take-storage-recoveries'),
+  onStorageRecovered: (listener: () => void) => {
+    const handler = () => listener();
+    ipcRenderer.on('storage-recovered', handler);
+    return () => ipcRenderer.removeListener('storage-recovered', handler);
+  },
+
   // Outbound SMTP
   sendEmail: (input: SendEmailInput) => ipcRenderer.invoke('send-email', input),
 

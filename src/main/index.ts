@@ -8,11 +8,12 @@ import { CredentialStore } from './engine/credential-store';
 import { AccountService, summarizeError } from './engine/account-service';
 import { TreeSorterService } from './engine/tree-sorter-service';
 import { buildMailExport, extractJson, parseTreeImport, toCsv } from './engine/tree-export';
+import { onStorageRecovered } from './engine/atomic-file';
 import { createAppUrlCheck, guardIpc, hardenWebContents, isPermissionAllowed, throttleOpens } from './security';
 
 // An AI-written tree is a few KB; anything far bigger is the wrong file
 const MAX_IMPORT_BYTES = 2 * 1024 * 1024;
-import type { AddAccountInput, IpcResult, SendEmailInput, SenderGroupMode, TreeSorterSettings } from '../renderer/types/index';
+import type { AddAccountInput, IpcResult, SendEmailInput, SenderGroupMode, StorageRecoveryNotice, TreeSorterSettings } from '../renderer/types/index';
 
 // ESM has no __dirname; derive it from this module's URL
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -25,6 +26,13 @@ let win: BrowserWindow | null;
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
 const INDEX_HTML = path.join(__dirname, '../dist/index.html');
 const isAppUrl = createAppUrlCheck({ devServerUrl: VITE_DEV_SERVER_URL, indexHtml: INDEX_HTML });
+
+// Files can be repaired before the window exists (the startup sync), so notices wait until the window takes them
+let pendingRecoveries: StorageRecoveryNotice[] = [];
+onStorageRecovered(({ file, outcome }) => {
+  pendingRecoveries = [...pendingRecoveries, { file: path.basename(file), outcome }];
+  win?.webContents.send('storage-recovered');
+});
 
 const storageService = new StorageService();
 const modEngine = new ModEngine();
@@ -231,6 +239,12 @@ handle('get-emails', async (_, providerId, folderId) => {
 
 handle('get-email-detail', async (_, providerId, emailId) => {
   return storageService.getEmailDetail(providerId, emailId);
+});
+
+handle('take-storage-recoveries', async () => {
+  const taken = pendingRecoveries;
+  pendingRecoveries = [];
+  return taken;
 });
 
 handle('get-trusted-senders', async (_, providerId: string) => {

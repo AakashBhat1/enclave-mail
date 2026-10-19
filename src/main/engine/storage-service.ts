@@ -15,6 +15,7 @@ import {
 } from '../../renderer/types/index';
 import type { FolderSnapshot, KnownFolder } from './imap-service';
 import { MessageStore, assertSafeId } from './message-store';
+import { isJsonArray, isJsonObject, readJsonSafe, writeJsonAtomic } from './atomic-file';
 import { groupBySender, isSenderFilter, matchesSenderFilter } from './sender-groups';
 import { DEFAULT_SORTER_SETTINGS, normalizeKeywords, sanitizeSorterSettings } from './tree-classifier';
 import { isReorderableFilter } from '../../renderer/lib/filters';
@@ -95,8 +96,7 @@ export class StorageService {
   // ---------- Providers ----------
 
   public getProviders(): ProviderEnclave[] {
-    if (!fs.existsSync(PROVIDERS_FILE)) return [];
-    return JSON.parse(fs.readFileSync(PROVIDERS_FILE, 'utf-8'));
+    return readJsonSafe<ProviderEnclave[]>(PROVIDERS_FILE, [], isJsonArray);
   }
 
   public getProvider(providerId: string): ProviderEnclave | null {
@@ -112,12 +112,12 @@ export class StorageService {
     this.messages.forget(target.id);
     this.sorterCache.delete(target.id);
     const remaining = providers.filter((p) => p.id !== target.id);
-    fs.writeFileSync(PROVIDERS_FILE, JSON.stringify(remaining, null, 2), 'utf-8');
+    writeJsonAtomic(PROVIDERS_FILE, remaining, { space: 2 });
   }
 
   public updateProvider(providerId: string, changes: Partial<ProviderEnclave>): ProviderEnclave | null {
     const providers = this.getProviders().map((p) => (p.id === providerId ? { ...p, ...changes } : p));
-    fs.writeFileSync(PROVIDERS_FILE, JSON.stringify(providers, null, 2), 'utf-8');
+    writeJsonAtomic(PROVIDERS_FILE, providers, { space: 2 });
     return providers.find((p) => p.id === providerId) ?? null;
   }
 
@@ -125,12 +125,12 @@ export class StorageService {
     const providers = this.getProviders();
     const storagePath = this.messages.providerDir(newProvider.id);
     fs.mkdirSync(path.join(storagePath, 'attachments'), { recursive: true });
-    fs.writeFileSync(path.join(storagePath, 'folders.json'), JSON.stringify(DEFAULT_FOLDERS, null, 2), 'utf-8');
-    fs.writeFileSync(path.join(storagePath, 'associations.json'), JSON.stringify([], null, 2), 'utf-8');
+    writeJsonAtomic(path.join(storagePath, 'folders.json'), DEFAULT_FOLDERS, { space: 2 });
+    writeJsonAtomic(path.join(storagePath, 'associations.json'), [], { space: 2 });
     this.messages.write(newProvider.id, []);
 
     const saved = { ...newProvider, storagePath };
-    fs.writeFileSync(PROVIDERS_FILE, JSON.stringify([...providers, saved], null, 2), 'utf-8');
+    writeJsonAtomic(PROVIDERS_FILE, [...providers, saved], { space: 2 });
     return saved;
   }
 
@@ -224,7 +224,7 @@ export class StorageService {
       const inFolder = all.filter((m) => (f.id === 'starred' ? m.isStarred : m.folderId === f.id));
       return { ...f, path: serverPath, totalCount: inFolder.length, unreadCount: inFolder.filter((m) => !m.isRead).length };
     });
-    fs.writeFileSync(this.providerFile(providerId, 'folders.json'), JSON.stringify(folders, null, 2), 'utf-8');
+    writeJsonAtomic(this.providerFile(providerId, 'folders.json'), folders, { space: 2 });
     this.updateProvider(providerId, { unreadTotal: folders.find((f) => f.id === 'inbox')?.unreadCount ?? 0 });
   }
 
@@ -233,9 +233,7 @@ export class StorageService {
   }
 
   public getFolders(providerId: string): Folder[] {
-    const fPath = this.providerFile(providerId, 'folders.json');
-    if (!fs.existsSync(fPath)) return [];
-    return JSON.parse(fs.readFileSync(fPath, 'utf-8'));
+    return readJsonSafe<Folder[]>(this.providerFile(providerId, 'folders.json'), [], isJsonArray);
   }
 
   // ---------- Reading mail ----------
@@ -357,15 +355,8 @@ export class StorageService {
 
   /** Senders whose remote images load without asking (the user chose "always" for them). */
   public getTrustedSenders(providerId: string): string[] {
-    const file = this.providerFile(providerId, 'trusted-senders.json');
-    if (!fs.existsSync(file)) return [];
-    try {
-      const raw: unknown = JSON.parse(fs.readFileSync(file, 'utf-8'));
-      return Array.isArray(raw) ? raw.filter((a): a is string => typeof a === 'string' && PLAIN_ADDRESS.test(a)) : [];
-    } catch (err) {
-      console.error('Trusted senders list is unreadable, starting empty:', err instanceof Error ? err.message : err);
-      return [];
-    }
+    const raw = readJsonSafe<unknown[]>(this.providerFile(providerId, 'trusted-senders.json'), [], isJsonArray);
+    return raw.filter((a): a is string => typeof a === 'string' && PLAIN_ADDRESS.test(a));
   }
 
   public trustSender(providerId: string, address: string): string[] {
@@ -374,16 +365,14 @@ export class StorageService {
     const current = this.getTrustedSenders(providerId);
     if (current.includes(clean)) return current;
     const next = [...current, clean];
-    fs.writeFileSync(this.providerFile(providerId, 'trusted-senders.json'), JSON.stringify(next, null, 2), 'utf-8');
+    writeJsonAtomic(this.providerFile(providerId, 'trusted-senders.json'), next, { space: 2 });
     return next;
   }
 
   // ---------- Association & agenda tree ----------
 
   private readAssociations(providerId: string): AssociationNode[] {
-    const aPath = this.providerFile(providerId, 'associations.json');
-    if (!fs.existsSync(aPath)) return [];
-    const assocs: AssociationNode[] = JSON.parse(fs.readFileSync(aPath, 'utf-8'));
+    const assocs = readJsonSafe<AssociationNode[]>(this.providerFile(providerId, 'associations.json'), [], isJsonArray);
     return [...assocs].sort((a, b) => a.position - b.position);
   }
 
@@ -393,7 +382,7 @@ export class StorageService {
       ...a,
       agendas: a.agendas.map((ag) => ({ ...ag, unreadCount: 0, totalCount: 0 })),
     }));
-    fs.writeFileSync(this.providerFile(providerId, 'associations.json'), JSON.stringify(stored, null, 2), 'utf-8');
+    writeJsonAtomic(this.providerFile(providerId, 'associations.json'), stored, { space: 2 });
   }
 
   /** The tree with live counts: letters filed by hand plus letters the Tree Sorter put there. */
@@ -620,23 +609,17 @@ export class StorageService {
   public getTreeSorter(providerId: string): TreeSorterFile {
     const cached = this.sorterCache.get(providerId);
     if (cached) return cached;
-    const file = this.providerFile(providerId, 'tree-sorter.json');
-    let loaded = EMPTY_SORTER;
-    if (fs.existsSync(file)) {
-      try {
-        const raw = JSON.parse(fs.readFileSync(file, 'utf-8')) as Partial<TreeSorterFile>;
-        loaded = { settings: sanitizeSorterSettings(raw.settings), lastScan: raw.lastScan ?? null, matches: raw.matches ?? {} };
-      } catch (err) {
-        console.error('Tree Sorter state is unreadable, starting fresh:', err instanceof Error ? err.message : err);
-      }
-    }
+    const raw = readJsonSafe<Partial<TreeSorterFile> | null>(this.providerFile(providerId, 'tree-sorter.json'), null, isJsonObject);
+    const loaded: TreeSorterFile = raw
+      ? { settings: sanitizeSorterSettings(raw.settings), lastScan: raw.lastScan ?? null, matches: raw.matches ?? {} }
+      : EMPTY_SORTER;
     this.sorterCache.set(providerId, loaded);
     return loaded;
   }
 
   public saveTreeSorter(providerId: string, state: TreeSorterFile): TreeSorterFile {
     assertSafeId(providerId, 'account id');
-    fs.writeFileSync(this.providerFile(providerId, 'tree-sorter.json'), JSON.stringify(state), 'utf-8');
+    writeJsonAtomic(this.providerFile(providerId, 'tree-sorter.json'), state);
     this.sorterCache.set(providerId, state);
     return state;
   }

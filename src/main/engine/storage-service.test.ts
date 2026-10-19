@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { EmailMessage, ProviderEnclave } from '../../renderer/types/index';
 import type { FolderSnapshot } from './imap-service';
 
@@ -12,6 +12,8 @@ vi.mock('node:os', async (importOriginal) => {
 });
 
 const { StorageService } = await import('./storage-service');
+const { onStorageRecovered } = await import('./atomic-file');
+type StorageRecovery = import('./atomic-file').StorageRecovery;
 
 const PROVIDER = 'prov_test';
 
@@ -209,5 +211,81 @@ describe('StorageService', () => {
       expect(() => storage.trustSender(PROVIDER, bad)).toThrow('Invalid sender address');
     }
     expect(storage.getTrustedSenders(PROVIDER)).toEqual([]);
+  });
+});
+
+describe('StorageService after a crash', () => {
+  const accountDir = () => path.join(home.dir, '.enclavemail', 'providers', PROVIDER);
+  const messagesFile = () => path.join(accountDir(), 'messages.json');
+  const providersFile = () => path.join(home.dir, '.enclavemail', 'providers.json');
+  const leftovers = (dir: string, marker: string) => fs.readdirSync(dir).filter((name) => name.includes(marker));
+  let recoveries: StorageRecovery[];
+  let stopListening: () => void;
+
+  beforeEach(() => {
+    fs.rmSync(home.dir, { recursive: true, force: true });
+    recoveries = [];
+    stopListening = onStorageRecovered((r) => recoveries.push(r));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const storage = new StorageService();
+    storage.addProvider(provider());
+    storage.saveSyncedMessages(PROVIDER, [snapshot([1], [email('inbox', '7', 1)])]);
+    storage.saveSyncedMessages(PROVIDER, [snapshot([1, 2], [email('inbox', '7', 2)])]);
+  });
+
+  afterEach(() => {
+    stopListening();
+    vi.restoreAllMocks();
+  });
+
+  it('leaves no temp files behind after ordinary writes', () => {
+    expect(leftovers(accountDir(), '.tmp')).toEqual([]);
+    expect(fs.existsSync(`${messagesFile()}.bak`)).toBe(true);
+  });
+
+  it('reads the last good copy when messages.json was cut off mid-write', () => {
+    fs.writeFileSync(messagesFile(), '[{"id":"inbox_7_2","uid":2,"subj', 'utf-8');
+    const reopened = new StorageService();
+    expect(reopened.getEmails(PROVIDER, 'inbox').map((m) => m.uid)).toEqual([1]);
+    expect(leftovers(accountDir(), 'messages.json.corrupt-')).toHaveLength(1);
+    expect(recoveries).toEqual([{ file: messagesFile(), outcome: 'restored' }]);
+  });
+
+  it('starts the account empty, keeps the damaged file and stays usable when there is no backup', () => {
+    fs.rmSync(`${messagesFile()}.bak`);
+    fs.writeFileSync(messagesFile(), '[{"id":', 'utf-8');
+    const reopened = new StorageService();
+    expect(reopened.getEmails(PROVIDER, 'inbox')).toEqual([]);
+    expect(() => reopened.getAssociations(PROVIDER)).not.toThrow();
+    expect(leftovers(accountDir(), 'messages.json.corrupt-')).toHaveLength(1);
+    expect(recoveries.map((r) => r.outcome)).toEqual(['reset']);
+    // The next sync repopulates it
+    reopened.saveSyncedMessages(PROVIDER, [snapshot([3], [email('inbox', '7', 3)])]);
+    expect(reopened.getEmails(PROVIDER, 'inbox').map((m) => m.uid)).toEqual([3]);
+  });
+
+  it('keeps the original when a crash left only a half-written temp file', () => {
+    fs.writeFileSync(`${messagesFile()}.tmp`, '[{"id":"inbox_7_9"', 'utf-8');
+    expect(new StorageService().getEmails(PROVIDER, 'inbox').map((m) => m.uid)).toEqual([2, 1]);
+    expect(recoveries).toEqual([]);
+  });
+
+  it('recovers the account list, folders and tree the same way', () => {
+    const reopened = new StorageService();
+    reopened.addAssociation(PROVIDER, 'Clients');
+    reopened.addAssociation(PROVIDER, 'Finance');
+    for (const file of [providersFile(), path.join(accountDir(), 'folders.json'), path.join(accountDir(), 'associations.json')]) {
+      fs.writeFileSync(file, '{"broken', 'utf-8');
+    }
+    const fresh = new StorageService();
+    expect(fresh.getProviders().map((p) => p.id)).toEqual([PROVIDER]);
+    expect(fresh.getFolders(PROVIDER).map((f) => f.id)).toContain('inbox');
+    expect(fresh.getAssociations(PROVIDER).map((a) => a.name)).toEqual(['Clients']);
+    expect(recoveries.map((r) => path.basename(r.file)).sort()).toEqual(['associations.json', 'folders.json', 'providers.json']);
+  });
+
+  it('treats a messages file of the wrong shape as damaged', () => {
+    fs.writeFileSync(messagesFile(), '{"not":"a list"}', 'utf-8');
+    expect(new StorageService().getEmails(PROVIDER, 'inbox').map((m) => m.uid)).toEqual([1]);
   });
 });

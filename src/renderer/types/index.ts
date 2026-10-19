@@ -95,6 +95,12 @@ export interface SenderGroup {
   members: number;
 }
 
+/** Sent by the main process after it repaired a damaged data file; `file` is the file name only. */
+export interface StorageRecoveryNotice {
+  file: string;
+  outcome: 'restored' | 'reset';
+}
+
 export interface SyncProgress {
   providerId: string;
   /** 'history' while older mail is still downloading, 'done' once everything is local, 'stopped' after a failure (the next sync resumes). */
