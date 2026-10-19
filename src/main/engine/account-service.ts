@@ -101,7 +101,9 @@ export class AccountService {
     private readonly onMailUpdate: MailUpdateListener = () => {},
     private readonly onProgress: SyncProgressListener = () => {},
     /** Runs after new mail is stored (e.g. the Tree Sorter's auto-run). */
-    private readonly afterMailStored: (providerId: string) => void = () => {}
+    private readonly afterMailStored: (providerId: string) => void = () => {},
+    /** Gets letters just downloaded (by sync or history download) before they are stored, e.g. to tag them. */
+    private readonly prepareNewMail: (providerId: string, incoming: EmailMessage[]) => EmailMessage[] = (_, incoming) => incoming
   ) {
     this.sessions = new ImapSessions(
       (id) => this.tryLoadAccess(id),
@@ -216,7 +218,10 @@ export class AccountService {
     }
 
     this.sessions.markSynced(provider.id);
-    this.storage.saveSyncedMessages(provider.id, snapshots);
+    this.storage.saveSyncedMessages(
+      provider.id,
+      snapshots.map((s) => ({ ...s, newMessages: this.prepare(provider.id, s.newMessages) }))
+    );
     this.runAfterStore(provider.id);
     const downloaded = snapshots.reduce((n, s) => n + s.newMessages.length, 0);
     const pending = snapshots.reduce((n, s) => n + s.pendingUids.length, 0);
@@ -225,6 +230,17 @@ export class AccountService {
     console.info(`[sync] ${provider.email}: ${downloaded} new message(s), ${pending} older pending, in ${Date.now() - started} ms`);
     this.startBackfill(provider.id, snapshots);
     return { provider: this.storage.getProvider(provider.id) ?? provider, newInbox };
+  }
+
+  // A broken hook must never cost the user their mail: the letters are stored untouched instead
+  private prepare(providerId: string, incoming: EmailMessage[]): EmailMessage[] {
+    if (incoming.length === 0) return incoming;
+    try {
+      return this.prepareNewMail(providerId, incoming);
+    } catch (err) {
+      console.error('New-mail hook failed:', err instanceof Error ? err.message : summarizeError(err));
+      return incoming;
+    }
   }
 
   private runAfterStore(providerId: string): void {
@@ -265,7 +281,7 @@ export class AccountService {
       if (buffered.length === 0 || (!force && buffered.length < BACKFILL_FLUSH_SIZE)) return;
       // The account may have been removed while the batch was downloading; never recreate its folder
       if (!stillWanted()) return;
-      this.storage.appendMessages(providerId, buffered);
+      this.storage.appendMessages(providerId, this.prepare(providerId, buffered));
       buffered = [];
       if (Date.now() - lastRefresh >= BACKFILL_REFRESH_MS) {
         lastRefresh = Date.now();

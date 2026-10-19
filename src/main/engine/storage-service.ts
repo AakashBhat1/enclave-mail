@@ -278,7 +278,9 @@ export class StorageService {
     const header = this.messages.read(providerId).find((m) => m.id === emailId);
     if (!header) return null;
     const treeMatches = this.getTreeSorter(providerId).matches[header.id];
-    return { ...header, ...this.messages.readBody(providerId, header.id), ...(treeMatches ? { treeMatches } : {}) };
+    // A deep copy: the header is shared with the cached list, and a caller pushing into its tags once
+    // made a change show in the UI that only some later, unrelated write put on disk
+    return structuredClone({ ...header, ...this.messages.readBody(providerId, header.id), ...(treeMatches ? { treeMatches } : {}) });
   }
 
   // ---------- Local message state ----------
@@ -292,6 +294,18 @@ export class StorageService {
       return next;
     });
     return changed ? this.messages.write(providerId, all) : all;
+  }
+
+  /** Adds tags to many letters in a single write; returns how many letters changed. */
+  public applyModTags(providerId: string, tagsById: ReadonlyMap<string, readonly string[]>): number {
+    let changed = 0;
+    this.updateMessages(providerId, (m) => {
+      const extra = (tagsById.get(m.id) ?? []).filter((tag) => !m.tags.includes(tag));
+      if (extra.length === 0) return null;
+      changed += 1;
+      return { ...m, tags: [...m.tags, ...extra] };
+    });
+    return changed;
   }
 
   public markEmailRead(providerId: string, emailId: string, isRead: boolean) {

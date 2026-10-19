@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { AddAccountInput, SendEmailInput, SenderGroupMode, SyncProgress, TreeSorterSettings } from '../renderer/types/index';
+import type { AddAccountInput, ModRule, SendEmailInput, SenderGroupMode, SyncProgress, TreeSorterSettings } from '../renderer/types/index';
 
 export const electronAPI = {
   // Provider Enclaves
@@ -72,8 +72,8 @@ export const electronAPI = {
   // Modding & Automation Engine
   getMods: () => ipcRenderer.invoke('get-mods'),
   toggleMod: (modId: string) => ipcRenderer.invoke('toggle-mod', modId),
-  runModOnEmail: (modId: string, emailId: string, providerId: string) => ipcRenderer.invoke('run-mod-on-email', modId, emailId, providerId),
-  saveModRule: (rule: any) => ipcRenderer.invoke('save-mod-rule', rule),
+  runModOnEmail: (modId: string | null, emailId: string, providerId: string) => ipcRenderer.invoke('run-mod-on-email', modId, emailId, providerId),
+  saveModRule: (rule: ModRule) => ipcRenderer.invoke('save-mod-rule', rule),
 
   // Window Controls
   minimizeWindow: () => ipcRenderer.send('window-minimize'),

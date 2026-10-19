@@ -218,9 +218,18 @@ export interface ModRule {
     value: string;
   };
   action: {
-    type: 'applyTag' | 'moveToFolder' | 'saveAttachment' | 'exportMarkdown';
+    // Moving mail waits for a real IMAP MOVE (a local move would be undone by the next sync)
+    type: 'applyTag' | 'exportMarkdown';
     targetValue: string;
   };
+}
+
+/** What "Run mod" did to one letter. */
+export interface ModRunResult {
+  appliedMods: string[];
+  tagsAdded: string[];
+  /** Markdown files written under ~/EnclaveMail/exports. */
+  exported: string[];
 }
 
 export interface ComposerState {

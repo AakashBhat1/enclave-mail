@@ -1,153 +1,130 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { ModRule, EmailMessage } from '../../renderer/types/index';
-import { isJsonArray, readJsonSafe, writeJsonAtomic } from './atomic-file';
+import type { ModRule } from '../../renderer/types/index';
+import { isJsonArray, readJsonSafe, writeFileAtomic, writeJsonAtomic } from './atomic-file';
+import { isInsideExportRoot, validateModRule, EXPORT_ROOT, type MarkdownExport } from './mod-rules';
+
+export { EXPORT_ROOT, planMods, resolveExportDir, validateModRule } from './mod-rules';
+export type { MarkdownExport, ModPlan, PlanOptions } from './mod-rules';
 
 const BASE_DIR = path.join(os.homedir(), '.enclavemail');
 const MODS_FILE = path.join(BASE_DIR, 'mods', 'rules.json');
-const INVOICES_EXPORT_DIR = path.join(os.homedir(), 'Downloads', 'EnclaveInvoices');
 
+const DEFAULT_RULES: ModRule[] = [
+  {
+    id: 'rule_invoice_autofiler',
+    name: 'Auto-File Finance Invoices & Receipts',
+    enabled: true,
+    providerId: 'all',
+    condition: { field: 'subject', operator: 'contains', value: 'Invoice' },
+    action: { type: 'applyTag', targetValue: 'Tax-Deductible' },
+  },
+  {
+    id: 'rule_devops_tagger',
+    name: 'GitHub & CI/CD Fast Tagger',
+    enabled: true,
+    providerId: 'all',
+    condition: { field: 'from', operator: 'contains', value: 'github.com' },
+    action: { type: 'applyTag', targetValue: 'DevOps-Pipeline' },
+  },
+  {
+    id: 'rule_markdown_sync',
+    name: 'Export Technical Newsletters to Markdown Notes',
+    enabled: true,
+    providerId: 'all',
+    condition: { field: 'subject', operator: 'contains', value: 'Pragmatic' },
+    action: { type: 'exportMarkdown', targetValue: 'Notes/TechReadings' },
+  },
+];
+
+function validOrNull(rule: unknown): ModRule | null {
+  try {
+    return validateModRule(rule);
+  } catch (err) {
+    console.error('Ignoring an invalid mod rule:', err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
+function idOf(entry: unknown): string | undefined {
+  const id = typeof entry === 'object' && entry !== null ? (entry as { id?: unknown }).id : undefined;
+  return typeof id === 'string' ? id : undefined;
+}
+
+function isLink(file: string): boolean {
+  try {
+    return fs.lstatSync(file).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function refuseLink(target: string): never {
+  throw new Error(`Refusing to write through ${target}: it is a link that could lead outside the export folder.`);
+}
+
+// Creates the folder one level at a time from the root and refuses any link (symlink or junction) on the
+// way, so nothing is ever created or written outside, even as an empty folder
+function ensureExportFolder(dir: string, realRoot: string): void {
+  let current = EXPORT_ROOT;
+  for (const segment of path.relative(EXPORT_ROOT, dir).split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    if (isLink(current)) refuseLink(current);
+    if (!fs.existsSync(current)) fs.mkdirSync(current);
+  }
+  // Backstop for anything lstat cannot see as a link
+  if (!isInsideExportRoot(fs.realpathSync(dir), realRoot)) refuseLink(dir);
+}
+
+/** Keeps the rule list on disk; what the rules do to a letter is worked out by planMods. */
 export class ModEngine {
   constructor() {
-    this.ensureModsFile();
+    if (!fs.existsSync(MODS_FILE)) writeJsonAtomic(MODS_FILE, DEFAULT_RULES, { space: 2 });
   }
 
-  private ensureModsFile() {
-    if (!fs.existsSync(path.dirname(MODS_FILE))) {
-      fs.mkdirSync(path.dirname(MODS_FILE), { recursive: true });
-    }
-    if (!fs.existsSync(MODS_FILE)) {
-      const defaultRules: ModRule[] = [
-        {
-          id: 'rule_invoice_autofiler',
-          name: 'Auto-File Finance Invoices & Receipts',
-          enabled: true,
-          providerId: 'all',
-          condition: {
-            field: 'subject',
-            operator: 'contains',
-            value: 'Invoice',
-          },
-          action: {
-            type: 'applyTag',
-            targetValue: 'Tax-Deductible',
-          },
-        },
-        {
-          id: 'rule_devops_tagger',
-          name: 'GitHub & CI/CD Fast Tagger',
-          enabled: true,
-          providerId: 'all',
-          condition: {
-            field: 'from',
-            operator: 'contains',
-            value: 'github.com',
-          },
-          action: {
-            type: 'applyTag',
-            targetValue: 'DevOps-Pipeline',
-          },
-        },
-        {
-          id: 'rule_markdown_sync',
-          name: 'Export Technical Newsletters to Markdown Notes',
-          enabled: true,
-          providerId: 'all',
-          condition: {
-            field: 'subject',
-            operator: 'contains',
-            value: 'Pragmatic',
-          },
-          action: {
-            type: 'exportMarkdown',
-            targetValue: 'Notes/TechReadings',
-          },
-        },
-      ];
-      writeJsonAtomic(MODS_FILE, defaultRules, { space: 2 });
-    }
+  // Entries this version cannot read (hand-edited, or from a newer version) are kept on every write
+  private readRaw(): unknown[] {
+    return readJsonSafe<unknown[]>(MODS_FILE, [], isJsonArray);
   }
 
+  /** Every rule on disk that still passes validation (a hand-edited file can't smuggle in a bad export). */
   public getRules(): ModRule[] {
-    return readJsonSafe<ModRule[]>(MODS_FILE, [], isJsonArray);
+    return this.readRaw()
+      .map(validOrNull)
+      .filter((rule): rule is ModRule => rule !== null);
   }
 
   public toggleRule(ruleId: string): boolean {
-    const rules = this.getRules();
-    const r = rules.find((x) => x.id === ruleId);
-    if (r) {
-      r.enabled = !r.enabled;
-      writeJsonAtomic(MODS_FILE, rules, { space: 2 });
-      return r.enabled;
-    }
-    return false;
+    const raw = this.readRaw();
+    const target = this.getRules().find((r) => r.id === ruleId);
+    if (!target) return false;
+    const enabled = !target.enabled;
+    writeJsonAtomic(MODS_FILE, raw.map((entry) => (idOf(entry) === ruleId ? { ...target, enabled } : entry)), { space: 2 });
+    return enabled;
   }
 
-  public saveRule(rule: ModRule): ModRule {
-    const rules = this.getRules();
-    const idx = rules.findIndex((r) => r.id === rule.id);
-    if (idx >= 0) {
-      rules[idx] = rule;
-    } else {
-      rules.push(rule);
-    }
-    writeJsonAtomic(MODS_FILE, rules, { space: 2 });
+  /** Validates, then adds or replaces the rule; an invalid rule throws and nothing is written. */
+  public saveRule(input: unknown): ModRule {
+    const rule = validateModRule(input);
+    const raw = this.readRaw();
+    const next = raw.some((entry) => idOf(entry) === rule.id) ? raw.map((entry) => (idOf(entry) === rule.id ? rule : entry)) : [...raw, rule];
+    writeJsonAtomic(MODS_FILE, next, { space: 2 });
     return rule;
   }
 
-  public executeModsOnEmail(email: EmailMessage): { appliedMods: string[]; modifiedEmail: EmailMessage } {
-    const rules = this.getRules().filter((r) => r.enabled);
-    const applied: string[] = [];
-
-    for (const rule of rules) {
-      if (rule.providerId !== 'all' && rule.providerId !== email.providerId) {
-        continue;
-      }
-
-      let match = false;
-      const targetStr =
-        rule.condition.field === 'subject'
-          ? email.subject
-          : rule.condition.field === 'from'
-          ? email.from.address
-          : email.snippet;
-
-      const testVal = rule.condition.value.toLowerCase();
-      const content = targetStr.toLowerCase();
-
-      if (rule.condition.operator === 'contains' && content.includes(testVal)) {
-        match = true;
-      } else if (rule.condition.operator === 'equals' && content === testVal) {
-        match = true;
-      } else if (rule.condition.operator === 'startsWith' && content.startsWith(testVal)) {
-        match = true;
-      }
-
-      if (match) {
-        applied.push(rule.name);
-        if (rule.action.type === 'applyTag') {
-          if (!email.tags.includes(rule.action.targetValue)) {
-            email.tags.push(rule.action.targetValue);
-          }
-        } else if (rule.action.type === 'moveToFolder') {
-          email.folderId = rule.action.targetValue;
-        } else if (rule.action.type === 'exportMarkdown') {
-          // Export email body to local markdown file
-          try {
-            const exportFolder = path.join(os.homedir(), rule.action.targetValue);
-            fs.mkdirSync(exportFolder, { recursive: true });
-            const sanitizedTitle = email.subject.replace(/[^a-zA-Z0-9_-]/g, '_');
-            const mdFile = path.join(exportFolder, `${sanitizedTitle}.md`);
-            const mdContent = `# ${email.subject}\n\n**From:** ${email.from.name} (${email.from.address})\n**Date:** ${email.date}\n\n---\n\n${email.bodyText || email.snippet}\n`;
-            fs.writeFileSync(mdFile, mdContent, 'utf-8');
-          } catch (e) {
-            console.error('Failed to export markdown:', e);
-          }
-        }
-      }
+  /** Writes planned Markdown exports and returns their paths; anything outside EXPORT_ROOT is refused. */
+  public writeExports(exports: readonly MarkdownExport[]): string[] {
+    const outside = exports.find((e) => !isInsideExportRoot(e.file));
+    if (outside) throw new Error(`Refusing to write ${outside.file}: it is not inside the export folder ${EXPORT_ROOT}.`);
+    if (exports.length === 0) return [];
+    fs.mkdirSync(EXPORT_ROOT, { recursive: true });
+    const realRoot = fs.realpathSync(EXPORT_ROOT);
+    for (const { file, content } of exports) {
+      ensureExportFolder(path.dirname(file), realRoot);
+      if (isLink(file) || isLink(`${file}.tmp`)) refuseLink(file);
+      writeFileAtomic(file, content, { backup: false });
     }
-
-    return { appliedMods: applied, modifiedEmail: email };
+    return exports.map((e) => e.file);
   }
 }

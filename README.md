@@ -32,7 +32,7 @@
 - **Association tree.** File mail under Account → Association (client or project) → Agenda (Project, Financial, Legal…), not just folders.
 - **Custom ordering.** Pin and reorder messages and associations by hand.
 - **Voice search.** Say a keyword, or "inbox" / "sent" / "starred", to filter or jump between folders.
-- **Automation mods.** Local rules ("if subject contains *receipt*, tag *invoice*") that run entirely on your machine.
+- **Automation mods.** Local rules ("if subject contains *receipt*, tag *invoice*") that run entirely on your machine. Tag rules run on every new letter as it arrives. A rule can also save a letter as a Markdown note, but only when you press **Run mod**, and only inside `~/EnclaveMail/exports`.
 
 ### A warm, modern interface
 - Light cream and espresso dark themes, with a circular reveal when you switch between them.
@@ -106,14 +106,14 @@ src/
 │       ├── account-service.ts  Add / sync / send orchestration, error messages
 │       ├── storage-service.ts  Per-account local storage under ~/.enclavemail
 │       ├── credential-store.ts Passwords encrypted with Electron safeStorage
-│       └── mod-engine.ts     Local automation rules
+│       ├── mod-rules.ts      Rule validation and matching (pure)
+│       └── mod-engine.ts     Rule storage and Markdown exports
 └── renderer/                 React 19 + Tailwind UI
     ├── App.tsx               Workspace layout and state
     ├── components/           Dock, tree nav, message list, reading pane, modals
     │   ├── fx/               WebGL light field, 3D envelope, send animation, skeletons
     │   └── ui/               Modal, toast, theme toggle, avatars
     └── lib/                  Theme, motion presets, date formatting
-mods/                         Example automation script
 ```
 
 **Tech stack:** Electron 34 · React 19 · TypeScript · Vite 6 · Tailwind CSS 3 · Motion · imapflow · nodemailer · mailparser · DOMPurify

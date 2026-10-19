@@ -12,6 +12,7 @@ import {
   SendOutcome,
   SenderGroup,
   SenderGroupMode,
+  ModRunResult,
   StorageRecoveryNotice,
   SyncProgress,
 } from './types/index';
@@ -426,15 +427,17 @@ const MailApp: React.FC = () => {
   };
 
   const handleTriggerMod = async (emailId: string) => {
-    if (window.electronAPI) {
-      const res = await window.electronAPI.runModOnEmail('rule_invoice_autofiler', emailId, activeProviderId);
-      if (res.success && res.appliedMods.length > 0) {
-        notify({ tone: 'success', title: 'Mod applied', description: res.appliedMods.join(', ') });
-        const msgs = await window.electronAPI.getEmails(activeProviderId, activeFilterId);
-        setEmails(msgs);
-      } else {
+    try {
+      // null: every enabled rule. The list refreshes through the mail-updated push when tags change
+      const res = await unwrap<ModRunResult>(window.electronAPI.runModOnEmail(null, emailId, activeProviderId));
+      if (res.appliedMods.length === 0) {
         notify({ tone: 'info', title: 'No rule matched', description: 'None of your automation mods apply to this email.' });
+        return;
       }
+      const exported = res.exported.length > 0 ? ` Saved ${res.exported.length === 1 ? 'a note' : `${res.exported.length} notes`} to your exports folder.` : '';
+      notify({ tone: 'success', title: 'Mod applied', description: `${res.appliedMods.join(', ')}.${exported}` });
+    } catch (err) {
+      notify({ tone: 'error', title: 'Mod failed', description: errorMessage(err) });
     }
   };
 
@@ -457,10 +460,11 @@ const MailApp: React.FC = () => {
   };
 
   const handleAddMod = async (rule: ModRule) => {
-    if (window.electronAPI) {
-      await window.electronAPI.saveModRule(rule);
-      const m = await window.electronAPI.getMods();
-      setMods(m);
+    try {
+      await unwrap<ModRule>(window.electronAPI.saveModRule(rule));
+      setMods(await window.electronAPI.getMods());
+    } catch (err) {
+      notify({ tone: 'error', title: 'Could not save that rule', description: errorMessage(err) });
     }
   };
 

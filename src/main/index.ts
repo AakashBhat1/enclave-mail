@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { StorageService, PROVIDERS_DIR } from './engine/storage-service';
 import { ModEngine } from './engine/mod-engine';
+import { runModsOnEmail, tagNewMail } from './engine/mod-runner';
 import { CredentialStore } from './engine/credential-store';
 import { AccountService, summarizeError } from './engine/account-service';
 import { TreeSorterService } from './engine/tree-sorter-service';
@@ -43,7 +44,9 @@ const accountService = new AccountService(
   new CredentialStore(PROVIDERS_DIR),
   (providerId, newInbox) => win?.webContents.send('mail-updated', { providerId, newInbox }),
   (progress) => win?.webContents.send('sync-progress', progress),
-  (providerId) => treeSorter.autoRun(providerId)
+  (providerId) => treeSorter.autoRun(providerId),
+  // Tag rules run on every letter as it arrives, before it is stored; exports only run when the user asks
+  (_providerId, incoming) => tagNewMail(modEngine, incoming)
 );
 
 // Wrap network-facing handlers so the renderer always gets a readable error instead of a rejected promise
@@ -276,15 +279,17 @@ handle('toggle-mod', async (_, modId) => {
   return modEngine.toggleRule(modId);
 });
 
-handle('save-mod-rule', async (_, rule) => {
-  return modEngine.saveRule(rule);
+handle('save-mod-rule', async (_, rule: unknown) => {
+  return toResult(async () => modEngine.saveRule(rule));
 });
 
-handle('run-mod-on-email', async (_, modId, emailId, providerId) => {
-  const email = storageService.getEmailDetail(providerId, emailId);
-  if (!email) return { success: false };
-  const res = modEngine.executeModsOnEmail(email);
-  return { success: true, appliedMods: res.appliedMods };
+// modId null runs every enabled rule (the reading pane's "Run mod"); an id runs just that rule
+handle('run-mod-on-email', async (_, modId: unknown, emailId: string, providerId: string) => {
+  return toResult(async () => {
+    const result = runModsOnEmail(storageService, modEngine, providerId, emailId, modId as string | null);
+    if (result.tagsAdded.length > 0) win?.webContents.send('mail-updated', { providerId, newInbox: 0 });
+    return result;
+  });
 });
 
 on('window-minimize', () => win?.minimize());
