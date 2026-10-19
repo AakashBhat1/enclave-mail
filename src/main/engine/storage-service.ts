@@ -19,6 +19,7 @@ import { isJsonArray, isJsonObject, readJsonSafe, writeJsonAtomic } from './atom
 import { groupBySender, isSenderFilter, matchesSenderFilter } from './sender-groups';
 import { DEFAULT_SORTER_SETTINGS, normalizeKeywords, sanitizeSorterSettings } from './tree-classifier';
 import { isReorderableFilter } from '../../renderer/lib/filters';
+import { ackFlags, isPendingFlag, parseServerId, pendingValue, queueFlags, type FlagKind, type PendingFlag } from './pending-flags';
 import type { ImportedBranch } from './tree-export';
 
 /** 'merge' unions keywords into existing nodes; 'replace' makes the file the source of truth for keywords. */
@@ -77,6 +78,7 @@ export class StorageService {
   private baseDir: string;
   private readonly messages = new MessageStore(PROVIDERS_DIR);
   private readonly sorterCache = new Map<string, TreeSorterFile>();
+  private lastFlagStamp = 0;
 
   constructor() {
     this.baseDir = BASE_DIR;
@@ -157,6 +159,12 @@ export class StorageService {
     // Local filing follows a letter the server renumbered or moved (same Message-ID, new UID)
     const previousByMessageId = new Map(existing.filter((m) => m.messageId).map((m) => [m.messageId as string, m]));
     const syncedFolders = new Set<string>(snapshots.map((s) => s.folder.id));
+    const queue = this.getPendingFlags(providerId);
+    // Folders from before two-way flags never sent their local reads and stars: their first sync keeps them and sends them
+    const migrated = new Set(this.getProvider(providerId)?.twoWayFolders ?? []);
+    const serverIds = new Set(snapshots.flatMap((s) => s.serverUids.map((uid) => `${s.folder.id}_${s.uidValidity}_${uid}`)));
+    const renumbered = new Map<string, string>();
+    const unsent: Omit<PendingFlag, 'queuedAt'>[] = [];
 
     const fresh = snapshots.flatMap((s) => {
       const downloaded = new Map(s.newMessages.map((m) => [m.id, m]));
@@ -168,9 +176,29 @@ export class StorageService {
         // Not downloaded yet: the history backfill will bring it in
         if (!base) return [];
         const carried = old ?? (fetched?.messageId ? previousByMessageId.get(fetched.messageId) : undefined);
-        // Read state from the server (newest window only), but never un-read something the user opened locally
-        const isRead = (s.seen[uid] ?? base.isRead) || (carried?.isRead ?? false);
-        if (!carried) return [{ ...base, isRead }];
+        // Pending changes follow only the same letter under a new UID: same folder, old UID gone. A copy in
+        // another folder (a letter sent to yourself sits in Inbox and Sent) keeps its own.
+        const movedFrom = carried && carried.id !== id && carried.folderId === s.folder.id && !serverIds.has(carried.id) ? carried : undefined;
+        if (movedFrom) renumbered.set(movedFrom.id, id);
+        // Read/star likewise come only from the same letter; a fresh download carries the server's flags
+        const local = old ?? movedFrom ?? base;
+        const server = s.flags[uid];
+
+        // The server's value wins, unless a local change is still on its way there. Letters outside the
+        // window the server reported keep their local value.
+        const resolve = (flag: FlagKind, serverValue: boolean | undefined, localValue: boolean): boolean => {
+          const pending = pendingValue(queue, id, flag) ?? (movedFrom ? pendingValue(queue, movedFrom.id, flag) : undefined);
+          if (pending !== undefined) return pending;
+          if (serverValue === undefined) return localValue;
+          if (!migrated.has(s.folder.id) && localValue && !serverValue) {
+            unsent.push({ emailId: id, flag, value: true });
+            return true;
+          }
+          return serverValue;
+        };
+        const isRead = resolve('seen', server?.seen, local.isRead);
+        const isStarred = resolve('flagged', server?.flagged, local.isStarred);
+        if (!carried) return [{ ...base, isRead, isStarred }];
         return [
           {
             ...base,
@@ -179,7 +207,7 @@ export class StorageService {
             position: old?.position,
             tags: carried.tags,
             isRead,
-            isStarred: carried.isStarred,
+            isStarred,
           },
         ];
       });
@@ -200,8 +228,27 @@ export class StorageService {
     this.pruneTreeMatches(providerId, removedIds);
 
     const all = this.messages.write(providerId, [...fresh, ...kept]);
+    this.reconcilePendingFlags(providerId, queue, renumbered, new Set(removedIds), unsent);
     this.writeFolderCounts(providerId, all, snapshots);
-    this.updateProvider(providerId, { lastSyncedAt: Date.now(), status: 'connected' });
+    this.updateProvider(providerId, { lastSyncedAt: Date.now(), status: 'connected', twoWayFolders: [...new Set([...migrated, ...syncedFolders])] });
+  }
+
+  // Pending changes follow a renumbered letter to its new id, and go away with a letter deleted on the server
+  private reconcilePendingFlags(
+    providerId: string,
+    queue: PendingFlag[],
+    renumbered: ReadonlyMap<string, string>,
+    removed: ReadonlySet<string>,
+    unsent: Omit<PendingFlag, 'queuedAt'>[]
+  ): void {
+    if (queue.length === 0 && unsent.length === 0) return;
+    const kept = queue
+      .map((c) => (renumbered.has(c.emailId) ? { ...c, emailId: renumbered.get(c.emailId) as string } : c))
+      .filter((c) => !removed.has(c.emailId));
+    const unchanged = kept.length === queue.length && kept.every((c, i) => c === queue[i]);
+    if (unchanged && unsent.length === 0) return;
+    this.writePendingFlags(providerId, kept);
+    if (unsent.length > 0) this.queueFlags(providerId, unsent);
   }
 
   /** Adds older letters fetched by the history backfill. Returns how many were new. */
@@ -308,8 +355,13 @@ export class StorageService {
     return changed;
   }
 
+  /** Read/star changes are applied locally at once and queued here until the server confirms them. */
   public markEmailRead(providerId: string, emailId: string, isRead: boolean) {
-    this.updateMessages(providerId, (m) => (m.id === emailId && m.isRead !== isRead ? { ...m, isRead } : null));
+    const target = this.messages.read(providerId).find((m) => m.id === emailId);
+    if (!target || target.isRead === isRead) return;
+    // Queued first: if the letter write then fails, the next sync still applies (and sends) the change
+    this.queueFlags(providerId, [{ emailId, flag: 'seen', value: isRead }]);
+    this.updateMessages(providerId, (m) => (m.id === emailId ? { ...m, isRead } : null));
     this.refreshFolderCounts(providerId);
   }
 
@@ -317,15 +369,53 @@ export class StorageService {
   public markFilterRead(providerId: string, filterId: string): number {
     const targets = new Set(this.getEmails(providerId, filterId).filter((m) => !m.isRead).map((m) => m.id));
     if (targets.size === 0) return 0;
+    this.queueFlags(providerId, [...targets].map((emailId) => ({ emailId, flag: 'seen' as const, value: true })));
     this.updateMessages(providerId, (m) => (targets.has(m.id) ? { ...m, isRead: true } : null));
     this.refreshFolderCounts(providerId);
     return targets.size;
   }
 
   public toggleStar(providerId: string, emailId: string): boolean {
-    const all = this.updateMessages(providerId, (m) => (m.id === emailId ? { ...m, isStarred: !m.isStarred } : null));
+    const target = this.messages.read(providerId).find((m) => m.id === emailId);
+    if (!target) return false;
+    const isStarred = !target.isStarred;
+    this.queueFlags(providerId, [{ emailId, flag: 'flagged', value: isStarred }]);
+    this.updateMessages(providerId, (m) => (m.id === emailId ? { ...m, isStarred } : null));
     this.refreshFolderCounts(providerId);
-    return all.find((m) => m.id === emailId)?.isStarred ?? false;
+    return isStarred;
+  }
+
+  // ---------- Read/star changes waiting for the server ----------
+
+  public getPendingFlags(providerId: string): PendingFlag[] {
+    return readJsonSafe<unknown[]>(this.providerFile(providerId, 'pending-flags.json'), [], isJsonArray).filter(isPendingFlag);
+  }
+
+  /** Drops the changes the server confirmed. */
+  public ackPendingFlags(providerId: string, done: readonly PendingFlag[]): void {
+    // A removed account must stay removed; writing the queue would recreate its folder
+    if (done.length === 0 || !this.getProvider(providerId)) return;
+    const queue = this.getPendingFlags(providerId);
+    const next = ackFlags(queue, done);
+    if (next.length !== queue.length) this.writePendingFlags(providerId, next);
+  }
+
+  // Only letters with a server UID are queued; a just-sent local copy has nothing to flag yet
+  private queueFlags(providerId: string, changes: Omit<PendingFlag, 'queuedAt'>[]): void {
+    const forServer = changes.filter((c) => parseServerId(c.emailId) !== null);
+    if (forServer.length === 0) return;
+    const stamped = forServer.map((change) => ({ ...change, queuedAt: this.nextFlagStamp() }));
+    this.writePendingFlags(providerId, queueFlags(this.getPendingFlags(providerId), stamped));
+  }
+
+  // Strictly increasing, so a change made while an older one is being sent is never mistaken for it
+  private nextFlagStamp(): number {
+    this.lastFlagStamp = Math.max(Date.now(), this.lastFlagStamp + 1);
+    return this.lastFlagStamp;
+  }
+
+  private writePendingFlags(providerId: string, queue: PendingFlag[]): void {
+    writeJsonAtomic(this.providerFile(providerId, 'pending-flags.json'), queue, { space: 2 });
   }
 
   /** Saves a hand-made order. Only Tree views use it; folders always sort newest first. */

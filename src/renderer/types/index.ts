@@ -163,6 +163,8 @@ export interface ProviderEnclave {
   server?: MailServerConfig;
   lastSyncedAt?: number;
   status: 'connected' | 'syncing' | 'offline' | 'mock';
+  /** Folders whose read/star state syncs both ways; a folder's first such sync keeps local reads/stars and sends them. */
+  twoWayFolders?: string[];
 }
 
 export type ProviderType = ProviderEnclave['type'];

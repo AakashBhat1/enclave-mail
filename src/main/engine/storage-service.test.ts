@@ -43,7 +43,7 @@ function email(folderId: string, uidValidity: string, uid: number, extra: Partia
 }
 
 function snapshot(serverUids: number[], newMessages: EmailMessage[], extra: Partial<FolderSnapshot> = {}): FolderSnapshot {
-  return { folder: { id: 'inbox', path: 'INBOX' }, uidValidity: '7', serverUids, seen: {}, newMessages, pendingUids: [], ...extra };
+  return { folder: { id: 'inbox', path: 'INBOX' }, uidValidity: '7', serverUids, flags: {}, newMessages, pendingUids: [], ...extra };
 }
 
 describe('StorageService', () => {
@@ -81,11 +81,131 @@ describe('StorageService', () => {
     expect(storage.getEmails(PROVIDER, 'inbox')).toMatchObject([{ id: 'inbox_8_40', isStarred: true }]);
   });
 
-  it('never un-reads a letter the user opened, and takes server read state for the window', () => {
-    storage.saveSyncedMessages(PROVIDER, [snapshot([1, 2], [email('inbox', '7', 1), email('inbox', '7', 2)])]);
+  it('carries a pending flag change over to the renumbered letter', () => {
+    storage.saveSyncedMessages(PROVIDER, [snapshot([1], [email('inbox', '7', 1, { messageId: '<a@x>' })])]);
     storage.markEmailRead(PROVIDER, 'inbox_7_1', true);
-    storage.saveSyncedMessages(PROVIDER, [snapshot([1, 2], [], { seen: { 1: false, 2: true } })]);
-    expect(storage.getEmails(PROVIDER, 'inbox').every((m) => m.isRead)).toBe(true);
+    storage.saveSyncedMessages(PROVIDER, [snapshot([40], [email('inbox', '8', 40, { messageId: '<a@x>' })], { uidValidity: '8' })]);
+    expect(storage.getEmails(PROVIDER, 'inbox')).toMatchObject([{ id: 'inbox_8_40', isRead: true }]);
+    expect(storage.getPendingFlags(PROVIDER)).toMatchObject([{ emailId: 'inbox_8_40', flag: 'seen', value: true }]);
+  });
+
+  describe('two-way flags', () => {
+    const server = (seen: boolean, flagged = false) => ({ seen, flagged });
+    const byId = (id: string) => storage.getEmails(PROVIDER, 'inbox').find((m) => m.id === id);
+    // What a successful push to the server leaves behind
+    const pushAll = () => storage.ackPendingFlags(PROVIDER, storage.getPendingFlags(PROVIDER));
+
+    beforeEach(() => {
+      storage.saveSyncedMessages(PROVIDER, [snapshot([1, 2], [email('inbox', '7', 1), email('inbox', '7', 2)])]);
+    });
+
+    it('keeps a letter read while that change still waits to reach the server', () => {
+      storage.markEmailRead(PROVIDER, 'inbox_7_1', true);
+      storage.saveSyncedMessages(PROVIDER, [snapshot([1, 2], [], { flags: { 1: server(false), 2: server(true) } })]);
+      expect(byId('inbox_7_1')?.isRead).toBe(true);
+      expect(byId('inbox_7_2')?.isRead).toBe(true);
+    });
+
+    it('takes "unread" from the server once nothing is pending (marked unread on another device)', () => {
+      storage.markEmailRead(PROVIDER, 'inbox_7_1', true);
+      pushAll();
+      storage.saveSyncedMessages(PROVIDER, [snapshot([1, 2], [], { flags: { 1: server(false), 2: server(false) } })]);
+      expect(byId('inbox_7_1')?.isRead).toBe(false);
+      expect(storage.getFolders(PROVIDER).find((f) => f.id === 'inbox')?.unreadCount).toBe(2);
+    });
+
+    it('keeps the local value for letters outside the window the server reported', () => {
+      storage.markEmailRead(PROVIDER, 'inbox_7_1', true);
+      pushAll();
+      storage.saveSyncedMessages(PROVIDER, [snapshot([1, 2], [], { flags: { 2: server(false) } })]);
+      expect(byId('inbox_7_1')?.isRead).toBe(true);
+    });
+
+    it('takes stars from the server as \\Flagged, unless a local star change is pending', () => {
+      storage.saveSyncedMessages(PROVIDER, [snapshot([1, 2], [], { flags: { 1: server(false, true), 2: server(false) } })]);
+      expect(byId('inbox_7_1')?.isStarred).toBe(true);
+
+      expect(storage.toggleStar(PROVIDER, 'inbox_7_1')).toBe(false);
+      storage.saveSyncedMessages(PROVIDER, [snapshot([1, 2], [], { flags: { 1: server(false, true), 2: server(false) } })]);
+      expect(byId('inbox_7_1')?.isStarred).toBe(false);
+    });
+
+    it('queues \\Seen for read changes and \\Flagged for stars, but not for no-op or local-only letters', () => {
+      storage.markEmailRead(PROVIDER, 'inbox_7_1', true);
+      storage.markEmailRead(PROVIDER, 'inbox_7_1', true);
+      storage.toggleStar(PROVIDER, 'inbox_7_2');
+      storage.saveSentEmail(provider(), { to: 'bo@x.io', subject: 'Hi', body: 'yo', html: '<p>yo</p>', messageId: '<s@x>' });
+      const sentId = storage.getEmails(PROVIDER, 'sent')[0].id;
+      storage.toggleStar(PROVIDER, sentId);
+      expect(storage.getPendingFlags(PROVIDER).map(({ emailId, flag, value }) => ({ emailId, flag, value }))).toEqual([
+        { emailId: 'inbox_7_1', flag: 'seen', value: true },
+        { emailId: 'inbox_7_2', flag: 'flagged', value: true },
+      ]);
+    });
+
+    it('queues a read change for every letter "mark all read" touches', () => {
+      expect(storage.markFilterRead(PROVIDER, 'inbox')).toBe(2);
+      expect(storage.getPendingFlags(PROVIDER).map((c) => c.emailId).sort()).toEqual(['inbox_7_1', 'inbox_7_2']);
+    });
+
+    it('keeps the queue across a restart', () => {
+      storage.toggleStar(PROVIDER, 'inbox_7_1');
+      expect(new StorageService().getPendingFlags(PROVIDER)).toMatchObject([{ emailId: 'inbox_7_1', flag: 'flagged', value: true }]);
+    });
+
+    it('drops pending changes for letters deleted on the server', () => {
+      storage.markEmailRead(PROVIDER, 'inbox_7_2', true);
+      storage.saveSyncedMessages(PROVIDER, [snapshot([1], [])]);
+      expect(storage.getPendingFlags(PROVIDER)).toEqual([]);
+    });
+
+    it('ignores a damaged or hand-edited queue entry', () => {
+      const file = path.join(home.dir, '.enclavemail', 'providers', PROVIDER, 'pending-flags.json');
+      fs.writeFileSync(file, JSON.stringify([{ emailId: 'inbox_7_1', flag: '\\Deleted', value: true, queuedAt: 1 }, 'junk']));
+      expect(storage.getPendingFlags(PROVIDER)).toEqual([]);
+    });
+
+    it('on the first two-way sync, keeps local reads and stars the server never heard of and queues them', () => {
+      storage.markEmailRead(PROVIDER, 'inbox_7_1', true);
+      storage.toggleStar(PROVIDER, 'inbox_7_2');
+      pushAll();
+      // An account from before two-way flags: its local state was never sent
+      storage.updateProvider(PROVIDER, { twoWayFolders: undefined });
+
+      storage.saveSyncedMessages(PROVIDER, [snapshot([1, 2], [], { flags: { 1: server(false), 2: server(true, false) } })]);
+      expect(byId('inbox_7_1')?.isRead).toBe(true);
+      expect(byId('inbox_7_2')).toMatchObject({ isRead: true, isStarred: true });
+      expect(storage.getPendingFlags(PROVIDER).map(({ emailId, flag, value }) => ({ emailId, flag, value }))).toEqual([
+        { emailId: 'inbox_7_1', flag: 'seen', value: true },
+        { emailId: 'inbox_7_2', flag: 'flagged', value: true },
+      ]);
+      expect(storage.getProvider(PROVIDER)?.twoWayFolders).toEqual(['inbox']);
+    });
+
+    it('migrates each folder on its own first sync, not when another folder synced', () => {
+      const archived = { ...snapshot([5], [email('archive', '3', 5)]), folder: { id: 'archive' as const, path: 'Archive' }, uidValidity: '3' };
+      storage.saveSyncedMessages(PROVIDER, [archived]);
+      storage.markEmailRead(PROVIDER, 'archive_3_5', true);
+      pushAll();
+      // Archive was synced before two-way flags existed; the inbox was synced since
+      storage.updateProvider(PROVIDER, { twoWayFolders: ['inbox'] });
+
+      storage.saveSyncedMessages(PROVIDER, [{ ...archived, newMessages: [], flags: { 5: server(false) } }]);
+      expect(storage.getEmails(PROVIDER, 'archive')[0].isRead).toBe(true);
+      expect(storage.getPendingFlags(PROVIDER)).toMatchObject([{ emailId: 'archive_3_5', flag: 'seen', value: true }]);
+      expect(storage.getProvider(PROVIDER)?.twoWayFolders?.sort()).toEqual(['archive', 'inbox']);
+    });
+
+    it('keeps a pending change on its own letter when a copy with the same Message-ID lands in another folder', () => {
+      storage.saveSyncedMessages(PROVIDER, [snapshot([1, 2, 3], [email('inbox', '7', 3, { messageId: '<self@x>' })])]);
+      storage.markEmailRead(PROVIDER, 'inbox_7_3', true);
+      const sentCopy = { ...snapshot([8], [email('sent', '4', 8, { messageId: '<self@x>' })]), folder: { id: 'sent' as const, path: 'Sent' }, uidValidity: '4' };
+      storage.saveSyncedMessages(PROVIDER, [snapshot([1, 2, 3], [], { flags: { 3: server(false) } }), sentCopy]);
+
+      expect(byId('inbox_7_3')?.isRead).toBe(true);
+      expect(storage.getEmails(PROVIDER, 'sent')[0].isRead).toBe(false);
+      expect(storage.getPendingFlags(PROVIDER)).toMatchObject([{ emailId: 'inbox_7_3', flag: 'seen', value: true }]);
+    });
   });
 
   it('appends history without duplicates and keeps folder counts right', () => {

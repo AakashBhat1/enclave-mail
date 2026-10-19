@@ -1,10 +1,11 @@
 import { ImapFlow, ListResponse } from 'imapflow';
 import { simpleParser, AddressObject, ParsedMail } from 'mailparser';
 import { EmailMessage, MailServerConfig } from '../../renderer/types/index';
+import { toUidSet } from './pending-flags';
 
 // A sync downloads the newest letters straight away; older history arrives through the background backfill
 const QUICK_DOWNLOAD_LIMIT = 50;
-// Read state is refreshed for the newest letters only; flags on years-old mail rarely change
+// Read and star state are refreshed for the newest letters only; flags on years-old mail rarely change
 const SEEN_WINDOW = 500;
 // History is fetched in batches so other IMAP work (IDLE, Sent copies) can interleave
 export const BACKFILL_BATCH_SIZE = 40;
@@ -26,13 +27,21 @@ export interface KnownFolder {
   uids: Set<number>;
 }
 
+/** A letter's server flags that the app mirrors. */
+export interface ServerFlags {
+  seen: boolean;
+  flagged: boolean;
+}
+
+export type StoreResult = 'stored' | 'refused' | 'renumbered';
+
 export interface FolderSnapshot {
   folder: RemoteFolder;
   uidValidity: string;
   /** Every UID currently in the folder on the server. */
   serverUids: number[];
-  /** Server \Seen state for the newest SEEN_WINDOW letters. */
-  seen: Record<number, boolean>;
+  /** Server \Seen and \Flagged state for the newest SEEN_WINDOW letters, by UID. */
+  flags: Record<number, ServerFlags>;
   /** Full messages, only for the newest UIDs the app did not have yet. */
   newMessages: EmailMessage[];
   /** Older UIDs still missing locally, newest first; the history backfill fetches these. */
@@ -190,6 +199,15 @@ async function parseAll(raw: RawMessage[], uidValidity: string, folder: RemoteFo
   return parsed;
 }
 
+// Every exit path (renumbered folder, failed command) must hand INBOX back to IDLE, or live mail stops
+async function reselectInbox(client: ImapFlow, previous: RemoteFolder): Promise<void> {
+  if (previous.id === 'inbox' || !client.usable) return;
+  await client
+    .getMailboxLock('INBOX')
+    .then((inbox) => inbox.release())
+    .catch((err) => console.error('Could not reselect INBOX:', err instanceof Error ? err.message : err));
+}
+
 async function fetchFolder(client: ImapFlow, folder: RemoteFolder, providerId: string, known?: KnownFolder): Promise<FolderSnapshot> {
   const lock = await client.getMailboxLock(folder.path);
   let raw: RawMessage[] = [];
@@ -197,7 +215,7 @@ async function fetchFolder(client: ImapFlow, folder: RemoteFolder, providerId: s
   try {
     const exists = client.mailbox ? client.mailbox.exists : 0;
     const uidValidity = client.mailbox ? String(client.mailbox.uidValidity) : '0';
-    snapshot = { folder, uidValidity, serverUids: [], seen: {}, newMessages: [], pendingUids: [] };
+    snapshot = { folder, uidValidity, serverUids: [], flags: {}, newMessages: [], pendingUids: [] };
     if (exists === 0) return snapshot;
 
     // UID SEARCH ALL returns only numbers, so listing a mailbox of thousands stays cheap
@@ -207,7 +225,7 @@ async function fetchFolder(client: ImapFlow, folder: RemoteFolder, providerId: s
     if (!uids || uids.length === 0) throw new Error(`Could not list the messages in ${folder.path}.`);
     snapshot.serverUids = uids;
     for await (const msg of client.fetch(`${Math.max(1, exists - SEEN_WINDOW + 1)}:*`, { uid: true, flags: true })) {
-      snapshot.seen[msg.uid] = msg.flags?.has('\\Seen') ?? false;
+      snapshot.flags[msg.uid] = { seen: msg.flags?.has('\\Seen') ?? false, flagged: msg.flags?.has('\\Flagged') ?? false };
     }
 
     // A changed UIDVALIDITY means the server renumbered the folder, so nothing cached can be trusted
@@ -274,15 +292,49 @@ export class ImapService {
         lock.release();
       }
     } finally {
-      // Every exit path (renumbered folder, failed fetch) must hand INBOX back to IDLE, or live mail stops
-      if (folder.id !== 'inbox' && client.usable) {
-        await client
-          .getMailboxLock('INBOX')
-          .then((inbox) => inbox.release())
-          .catch((err) => console.error('Could not reselect INBOX:', err instanceof Error ? err.message : err));
-      }
+      await reselectInbox(client, folder);
     }
     return parseAll(raw, uidValidity, folder, providerId);
+  }
+
+  /**
+   * Sets or clears one flag on several letters of a folder. 'renumbered': the folder's UIDs changed since
+   * they were recorded (they now point at other letters), so nothing was touched. 'refused': the server
+   * said no (read-only folder, flag not allowed). A dropped connection throws.
+   */
+  public static async storeFlag(
+    client: ImapFlow,
+    folder: RemoteFolder,
+    uidValidity: string,
+    uids: number[],
+    flag: string,
+    value: boolean
+  ): Promise<StoreResult> {
+    try {
+      let lock;
+      try {
+        lock = await client.getMailboxLock(folder.path);
+      } catch (err) {
+        if (!client.usable) throw err;
+        // The folder was deleted or renamed on the server; the next sync drops its letters
+        console.error(`[flags] could not open ${folder.path}:`, err instanceof Error ? err.message : err);
+        return 'refused';
+      }
+      try {
+        if (!client.mailbox || String(client.mailbox.uidValidity) !== uidValidity) return 'renumbered';
+        const range = toUidSet(uids);
+        const ok = value ? await client.messageFlagsAdd(range, [flag], { uid: true }) : await client.messageFlagsRemove(range, [flag], { uid: true });
+        if (ok) return 'stored';
+        // imapflow answers false for a NO and for a lost connection alike; only the first is final
+        if (!client.usable) throw new Error(`The connection closed while updating ${flag}.`);
+        console.error(`[flags] the server refused ${value ? 'setting' : 'clearing'} ${flag} in ${folder.path}`);
+        return 'refused';
+      } finally {
+        lock.release();
+      }
+    } finally {
+      await reselectInbox(client, folder);
+    }
   }
 
   // Many hosts (cPanel, etc.) do not file SMTP-sent mail automatically, so store a copy ourselves

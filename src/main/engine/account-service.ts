@@ -4,6 +4,7 @@ import { CredentialStore } from './credential-store';
 import { BACKFILL_BATCH_SIZE, FolderSnapshot, ImapService, RemoteFolder } from './imap-service';
 import { SmtpService } from './smtp-service';
 import { ImapSessions, type AccountAccess } from './imap-sessions';
+import { IMAP_FLAG, pushPendingFlags, type FlagPushResult, type FlagStore } from './flag-sync';
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const HOST_PATTERN = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
@@ -94,6 +95,8 @@ export class AccountService {
   private readonly backfilling = new Set<string>();
   // A sync that found missing history while a backfill was already running; it is re-planned once that ends
   private readonly backfillRequested = new Set<string>();
+  // Read/star pushes for one account run one after another, so a confirmation is never applied out of order
+  private readonly flagPushes = new Map<string, Promise<void>>();
 
   constructor(
     private readonly storage: StorageService,
@@ -194,9 +197,59 @@ export class AccountService {
     return sync;
   }
 
+  /**
+   * Sends queued read/star changes to the server after a local change. A sync already running goes
+   * first: the server flags it fetched predate this change, and the change must still be pending when
+   * that sync saves, or the stale server value would win.
+   */
+  public pushFlagsSoon(providerId: string): void {
+    const running = this.inflight.get(providerId);
+    void (running ? running.catch(() => undefined).then(() => this.pushFlags(providerId)) : this.pushFlags(providerId));
+  }
+
+  private pushFlags(providerId: string): Promise<void> {
+    const next = (this.flagPushes.get(providerId) ?? Promise.resolve()).then(() => this.sendPendingFlags(providerId));
+    this.flagPushes.set(providerId, next);
+    void next.finally(() => {
+      if (this.flagPushes.get(providerId) === next) this.flagPushes.delete(providerId);
+    });
+    return next;
+  }
+
+  // Never throws: whatever was not confirmed stays queued for the next sync or reconnect
+  private async sendPendingFlags(providerId: string): Promise<void> {
+    try {
+      // Accounts without server settings have nobody to tell
+      if (!this.storage.getProvider(providerId)?.server || this.storage.getPendingFlags(providerId).length === 0) return;
+      let connected = false;
+      const store: FlagStore = async (batch) => {
+        const session = await this.sessions.acquire(providerId);
+        connected = true;
+        const folder = session.folders.find((f) => f.id === batch.folderId);
+        if (!folder) return 'refused';
+        return ImapService.storeFlag(session.client, folder, batch.uidValidity, batch.uids, IMAP_FLAG[batch.flag], batch.value);
+      };
+      let result: FlagPushResult;
+      try {
+        result = await pushPendingFlags(this.storage, providerId, store);
+      } catch (err) {
+        // A long-idle connection can die silently; one retry on a fresh login covers that. Failing to
+        // connect at all means offline, and a retry would only wait out the same timeout again.
+        if (!connected) throw err;
+        this.sessions.discard(providerId);
+        result = await pushPendingFlags(this.storage, providerId, store);
+      }
+      console.info(`[flags] ${result.sent} change(s) sent, ${result.dropped} dropped, ${result.waiting} waiting for a sync`);
+    } catch (err) {
+      console.error('Could not send read/star changes yet:', err instanceof Error ? err.message : summarizeError(err));
+    }
+  }
+
   private async runSync(providerId: string): Promise<SyncResult> {
     const { provider } = this.loadAccount(providerId);
     const started = Date.now();
+    // Changes go up before the flags come down, so the server already agrees with what is shown
+    await this.pushFlags(provider.id);
     const known = this.storage.getKnownFolders(provider.id);
     const attempt = async () => {
       const session = await this.sessions.acquire(provider.id);
@@ -229,6 +282,8 @@ export class AccountService {
     const newInbox = provider.lastSyncedAt ? snapshots.find((s) => s.folder.id === 'inbox')?.newMessages.length ?? 0 : 0;
     console.info(`[sync] ${provider.email}: ${downloaded} new message(s), ${pending} older pending, in ${Date.now() - started} ms`);
     this.startBackfill(provider.id, snapshots);
+    // Changes this sync queued (a folder's first two-way sync) or moved to new UIDs go out right after it
+    if (this.storage.getPendingFlags(provider.id).length > 0) this.pushFlagsSoon(provider.id);
     return { provider: this.storage.getProvider(provider.id) ?? provider, newInbox };
   }
 

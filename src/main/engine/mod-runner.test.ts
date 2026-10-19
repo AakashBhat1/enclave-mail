@@ -42,7 +42,7 @@ function letter(uid: number, subject: string, extra: Partial<EmailMessage> = {})
 }
 
 function snapshot(messages: EmailMessage[]): FolderSnapshot {
-  return { folder: { id: 'inbox', path: 'INBOX' }, uidValidity: '7', serverUids: messages.map((m) => m.uid ?? 0), seen: {}, newMessages: messages, pendingUids: [] };
+  return { folder: { id: 'inbox', path: 'INBOX' }, uidValidity: '7', serverUids: messages.map((m) => m.uid ?? 0), flags: {}, newMessages: messages, pendingUids: [] };
 }
 
 const tagsOf = (storage: InstanceType<typeof StorageService>, id: string) => storage.getEmails(PROVIDER, 'inbox').find((m) => m.id === id)?.tags;

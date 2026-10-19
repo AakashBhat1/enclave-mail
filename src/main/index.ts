@@ -224,7 +224,11 @@ handle('get-sender-groups', async (_, providerId: string, mode: SenderGroupMode)
 });
 
 handle('mark-filter-read', async (_, providerId: string, filterId: string) => {
-  return toResult(async () => storageService.markFilterRead(providerId, filterId));
+  return toResult(async () => {
+    const marked = storageService.markFilterRead(providerId, filterId);
+    if (marked > 0) accountService.pushFlagsSoon(providerId);
+    return marked;
+  });
 });
 
 handle('reorder-emails', async (_, providerId, emailIds) => {
@@ -258,13 +262,18 @@ handle('trust-sender', async (_, providerId: string, address: string) => {
   return toResult(async () => storageService.trustSender(providerId, address));
 });
 
-handle('mark-email-read', async (_, providerId, emailId, isRead) => {
+// Read and star change locally at once; the server is told in the background (and again later if offline)
+handle('mark-email-read', async (_, providerId: string, emailId: string, isRead: unknown) => {
+  if (typeof isRead !== 'boolean') throw new Error('Invalid read state.');
   storageService.markEmailRead(providerId, emailId, isRead);
+  accountService.pushFlagsSoon(providerId);
   return true;
 });
 
-handle('toggle-star', async (_, providerId, emailId) => {
-  return storageService.toggleStar(providerId, emailId);
+handle('toggle-star', async (_, providerId: string, emailId: string) => {
+  const isStarred = storageService.toggleStar(providerId, emailId);
+  accountService.pushFlagsSoon(providerId);
+  return isStarred;
 });
 
 handle('send-email', async (_, input: SendEmailInput) => {
