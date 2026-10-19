@@ -26,7 +26,7 @@ export function BootSplash() {
 
         <h1 className="display mt-14 flex gap-3 text-5xl text-foreground">
           {WORDMARK.map((word, i) => (
-            <span key={word} className="inline-block overflow-hidden pb-1">
+            <span key={word} className="word-mask -mr-[0.15em] pb-1">
               <span className={`word-rise ${i === 1 ? 'italic text-primary' : ''}`} style={{ animationDelay: `${0.25 + i * 0.12}s` }}>
                 {word}
               </span>

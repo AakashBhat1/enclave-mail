@@ -43,7 +43,7 @@ function EmptyReader() {
       </motion.div>
       <h3 className="display mt-12 text-[24px] leading-tight text-foreground">
         {words.map((word, i) => (
-          <span key={i} className="mr-[0.25em] inline-block overflow-hidden pb-1 align-bottom">
+          <span key={i} className="word-mask mr-[0.1em] pb-1 align-bottom">
             <span className="word-rise" style={{ animationDelay: `${0.15 + i * 0.07}s` }}>
               {word}
             </span>
@@ -202,7 +202,7 @@ function Letter({ email, associations, onReply, onTriggerMod, onToggleStar, onOp
           {/* Subject: each word rises out of its own mask */}
           <h1 className="display mt-3 text-[24px] leading-[1.18] text-foreground xl:text-[27px]">
             {words.map((word, i) => (
-              <span key={i} className="mr-[0.24em] inline-block overflow-hidden pb-[0.08em] align-bottom">
+              <span key={i} className="word-mask mr-[0.09em] pb-[0.08em] align-bottom">
                 <span className="word-rise" style={{ animationDelay: `${0.05 + Math.min(i, 12) * 0.035}s` }}>
                   {word}
                 </span>

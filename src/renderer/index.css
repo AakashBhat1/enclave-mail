@@ -233,6 +233,13 @@ textarea,
   display: inline-block;
   animation: word-rise 0.9s var(--ease-out-expo) both;
 }
+/* The clipping box a .word-rise word rises out of. Italic and overhanging glyphs (a slanted l, f, y) reach
+   past their own box, so the mask is padded on the right; each use takes that width back with its margin. */
+.word-mask {
+  display: inline-block;
+  overflow: hidden;
+  padding-right: 0.15em;
+}
 
 @keyframes shimmer {
   to {

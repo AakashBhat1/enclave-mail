@@ -140,7 +140,7 @@ export function MessageList({
       <div className="space-y-2.5 px-3.5 pb-2.5 pt-3.5">
         <div className="flex items-baseline justify-between gap-2">
           <h1 className="display min-w-0 truncate text-[22px] leading-none text-foreground">
-            <span key={title} className="inline-block overflow-hidden pb-1 align-bottom">
+            <span key={title} className="word-mask -mr-[0.15em] pb-1 align-bottom">
               <span className="word-rise">{title}</span>
             </span>
           </h1>
