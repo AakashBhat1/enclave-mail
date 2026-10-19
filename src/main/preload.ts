@@ -14,6 +14,8 @@ export const electronAPI = {
   getEmailDetail: (providerId: string, emailId: string) => ipcRenderer.invoke('get-email-detail', providerId, emailId),
   markEmailRead: (providerId: string, emailId: string, isRead: boolean) => ipcRenderer.invoke('mark-email-read', providerId, emailId, isRead),
   toggleStar: (providerId: string, emailId: string) => ipcRenderer.invoke('toggle-star', providerId, emailId),
+  getTrustedSenders: (providerId: string) => ipcRenderer.invoke('get-trusted-senders', providerId),
+  trustSender: (providerId: string, address: string) => ipcRenderer.invoke('trust-sender', providerId, address),
 
   // Association & Agenda Tree
   getAssociations: (providerId: string) => ipcRenderer.invoke('get-associations', providerId),

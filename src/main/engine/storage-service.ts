@@ -38,6 +38,8 @@ const PROVIDERS_FILE = path.join(BASE_DIR, 'providers.json');
 const SERVER_FOLDERS = new Set(['inbox', 'sent', 'drafts', 'archive']);
 const MAX_NODE_NAME = 80;
 const MAX_KEYWORDS_PER_NODE = 50;
+// local@domain, no spaces, within RFC 5321 length limits
+const PLAIN_ADDRESS = /^[^\s@]{1,64}@[^\s@]{1,255}$/;
 
 const DEFAULT_FOLDERS: Folder[] = [
   { id: 'inbox', name: 'Inbox', path: 'INBOX', unreadCount: 0, totalCount: 0, iconName: 'Inbox' },
@@ -349,6 +351,31 @@ export class StorageService {
     };
     this.messages.write(provider.id, [sentMessage, ...this.messages.read(provider.id)]);
     return sentMessage;
+  }
+
+  // ---------- Remote content ----------
+
+  /** Senders whose remote images load without asking (the user chose "always" for them). */
+  public getTrustedSenders(providerId: string): string[] {
+    const file = this.providerFile(providerId, 'trusted-senders.json');
+    if (!fs.existsSync(file)) return [];
+    try {
+      const raw: unknown = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      return Array.isArray(raw) ? raw.filter((a): a is string => typeof a === 'string' && PLAIN_ADDRESS.test(a)) : [];
+    } catch (err) {
+      console.error('Trusted senders list is unreadable, starting empty:', err instanceof Error ? err.message : err);
+      return [];
+    }
+  }
+
+  public trustSender(providerId: string, address: string): string[] {
+    const clean = typeof address === 'string' ? address.trim().toLowerCase() : '';
+    if (!PLAIN_ADDRESS.test(clean)) throw new Error('Invalid sender address.');
+    const current = this.getTrustedSenders(providerId);
+    if (current.includes(clean)) return current;
+    const next = [...current, clean];
+    fs.writeFileSync(this.providerFile(providerId, 'trusted-senders.json'), JSON.stringify(next, null, 2), 'utf-8');
+    return next;
   }
 
   // ---------- Association & agenda tree ----------

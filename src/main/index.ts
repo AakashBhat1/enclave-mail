@@ -233,6 +233,14 @@ handle('get-email-detail', async (_, providerId, emailId) => {
   return storageService.getEmailDetail(providerId, emailId);
 });
 
+handle('get-trusted-senders', async (_, providerId: string) => {
+  return storageService.getTrustedSenders(providerId);
+});
+
+handle('trust-sender', async (_, providerId: string, address: string) => {
+  return toResult(async () => storageService.trustSender(providerId, address));
+});
+
 handle('mark-email-read', async (_, providerId, emailId, isRead) => {
   storageService.markEmailRead(providerId, emailId, isRead);
   return true;

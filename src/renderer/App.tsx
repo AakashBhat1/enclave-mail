@@ -19,6 +19,7 @@ import { AssociationTreeNav, type NavMode } from './components/AssociationTreeNa
 import { TreeSorterModal } from './components/sorter/TreeSorterModal';
 import { useSenderGroups } from './lib/use-sender-groups';
 import { isReorderableFilter } from './lib/filters';
+import { errorMessage, unwrap } from './lib/ipc';
 import { MessageList } from './components/MessageList';
 import { ReadingPane } from './components/ReadingPane';
 import { ComposerModal, type SentInfo } from './components/ComposerModal';
@@ -89,6 +90,7 @@ const MailApp: React.FC = () => {
   const [activeProviderId, setActiveProviderId] = useState<string>('');
   const [folders, setFolders] = useState<Folder[]>([]);
   const [associations, setAssociations] = useState<AssociationNode[]>([]);
+  const [trustedSenders, setTrustedSenders] = useState<string[]>([]);
   const [activeFilterId, setActiveFilterId] = useState<string>('inbox');
   const [activeFilterLabel, setActiveFilterLabel] = useState<string>('Inbox');
   const [emails, setEmails] = useState<EmailMessage[]>([]);
@@ -153,12 +155,15 @@ const MailApp: React.FC = () => {
     if (!activeProviderId) return;
     async function loadProviderData() {
       if (window.electronAPI) {
-        const [f, a] = await Promise.all([
+        const [f, a, trusted] = await Promise.all([
           window.electronAPI.getFolders(activeProviderId),
           window.electronAPI.getAssociations(activeProviderId),
+          // Losing the list only means images ask again; it must not stop the folders and tree loading
+          window.electronAPI.getTrustedSenders(activeProviderId).catch(() => [] as string[]),
         ]);
         setFolders(f);
         setAssociations(a);
+        setTrustedSenders(trusted);
         setActiveFilterId('inbox');
         setActiveFilterLabel('Inbox');
       }
@@ -418,6 +423,15 @@ const MailApp: React.FC = () => {
     }
   };
 
+  const handleTrustSender = async (address: string) => {
+    try {
+      setTrustedSenders(await unwrap<string[]>(window.electronAPI.trustSender(activeProviderId, address)));
+      notify({ tone: 'success', title: 'Images on for this sender', description: `Remote images from ${address} will load automatically.` });
+    } catch (err) {
+      notify({ tone: 'error', title: 'Could not save that sender', description: errorMessage(err) });
+    }
+  };
+
   const handleToggleMod = async (modId: string) => {
     if (window.electronAPI) {
       const enabled = await window.electronAPI.toggleMod(modId);
@@ -547,6 +561,8 @@ const MailApp: React.FC = () => {
             onTriggerMod={handleTriggerMod}
             onToggleStar={(id) => handleToggleStar(id)}
             onOpenTreeMove={openTreeMove}
+            trustedSenders={trustedSenders}
+            onTrustSender={handleTrustSender}
           />
         </PaneEntrance>
       </div>

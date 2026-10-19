@@ -1,8 +1,9 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Download, FileText, FolderTree, Info, Lock, Reply, Sparkles, Wand2 } from 'lucide-react';
-import DOMPurify from 'dompurify';
+import { Download, FileText, FolderTree, ImageOff, Info, Lock, Reply, Sparkles, Wand2 } from 'lucide-react';
 import { EmailMessage, AssociationNode } from '../types/index';
+import { buildEmailDocument } from '../lib/email-document';
+import { EmailFrame } from './reader/EmailFrame';
 import { Envelope3D } from './fx/Envelope3D';
 import { Pebble } from './ui/Pebble';
 import { StarButton } from './ui/StarButton';
@@ -20,6 +21,9 @@ interface ReadingPaneProps {
   onTriggerMod: (emailId: string) => void;
   onToggleStar: (emailId: string) => void;
   onOpenTreeMove?: (email: EmailMessage) => void;
+  /** Senders whose remote images load without asking (lowercase addresses). */
+  trustedSenders?: string[];
+  onTrustSender?: (address: string) => void;
 }
 
 const rise = (delay: number) => ({
@@ -53,7 +57,16 @@ function EmptyReader() {
   );
 }
 
-export function ReadingPane({ email, associations = [], onReply, onTriggerMod, onToggleStar, onOpenTreeMove }: ReadingPaneProps) {
+export function ReadingPane({
+  email,
+  associations = [],
+  onReply,
+  onTriggerMod,
+  onToggleStar,
+  onOpenTreeMove,
+  trustedSenders = [],
+  onTrustSender,
+}: ReadingPaneProps) {
   const notify = useToast();
 
   return (
@@ -79,6 +92,8 @@ export function ReadingPane({ email, associations = [], onReply, onTriggerMod, o
               onTriggerMod={onTriggerMod}
               onToggleStar={onToggleStar}
               onOpenTreeMove={onOpenTreeMove}
+              trustedSenders={trustedSenders}
+              onTrustSender={onTrustSender}
               onAttachment={(name) =>
                 notify({ tone: 'info', title: 'Attachment downloads are coming soon', description: `“${name}” is listed but can’t be saved yet.` })
               }
@@ -90,30 +105,29 @@ export function ReadingPane({ email, associations = [], onReply, onTriggerMod, o
   );
 }
 
-interface LetterProps extends Omit<ReadingPaneProps, 'email'> {
+interface LetterProps extends Omit<ReadingPaneProps, 'email' | 'trustedSenders'> {
   email: EmailMessage;
   associations: AssociationNode[];
+  trustedSenders: string[];
   onAttachment: (filename: string) => void;
 }
 
-function Letter({ email, associations, onReply, onTriggerMod, onToggleStar, onOpenTreeMove, onAttachment }: LetterProps) {
+function Letter({ email, associations, onReply, onTriggerMod, onToggleStar, onOpenTreeMove, trustedSenders, onTrustSender, onAttachment }: LetterProps) {
   const assoc = associations.find((a) => a.id === email.associationId);
   const agenda = assoc?.agendas.find((ag) => ag.id === email.agendaId);
   const sender = email.from.name || email.from.address;
+  const senderAddress = email.from.address.trim().toLowerCase();
   const words = email.subject.split(' ');
   const autoBranches = autoFiledLabels(email, associations);
 
-  // Sanitize the HTML for safety, stripping scripts and remote tracking pixels
-  const sanitizedHtml = useMemo(
-    () =>
-      email.bodyHtml
-        ? DOMPurify.sanitize(email.bodyHtml, {
-            FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'form'],
-            FORBID_ATTR: ['onerror', 'onload', 'onclick'],
-          })
-        : '',
-    [email.bodyHtml]
+  // Letter remounts per email, so "load images" only ever applies to the one being read
+  const [loadOnce, setLoadOnce] = useState(false);
+  const remoteAllowed = loadOnce || trustedSenders.includes(senderAddress);
+  const page = useMemo(
+    () => (email.bodyHtml ? buildEmailDocument(email.bodyHtml, { allowRemote: remoteAllowed }) : null),
+    [email.bodyHtml, remoteAllowed]
   );
+  const blocked = page?.blockedCount ?? 0;
 
   return (
     <>
@@ -134,9 +148,12 @@ function Letter({ email, associations, onReply, onTriggerMod, onToggleStar, onOp
           </button>
         </div>
         <div className="flex items-center gap-2">
-          <span className="chip border-moss/25 bg-moss/10 text-moss" title="Scripts are stripped from this email before it is shown">
+          <span
+            className="chip border-moss/25 bg-moss/10 text-moss"
+            title={`Shown in a sealed frame: scripts never run and links open in your browser. Remote images are ${remoteAllowed ? 'on' : 'blocked'} for this email.`}
+          >
             <Lock className="size-3" />
-            <span className="hidden lg:inline">Sandboxed</span>
+            <span className="hidden lg:inline">Scripts off · images {remoteAllowed ? 'on' : 'blocked'}</span>
           </span>
           <StarButton starred={email.isStarred} onToggle={() => onToggleStar(email.id)} size="md" />
         </div>
@@ -248,6 +265,29 @@ function Letter({ email, associations, onReply, onTriggerMod, onToggleStar, onOp
             </motion.div>
           )}
 
+          {blocked > 0 && (
+            <motion.div
+              {...rise(0.3)}
+              role="status"
+              className="mt-5 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border border-border bg-sunken/70 px-3 py-2 text-[11.5px] text-foreground/80"
+            >
+              <ImageOff className="size-3.5 flex-shrink-0 text-muted" />
+              <span>
+                {blocked === 1 ? '1 remote image' : `${blocked} remote images`} blocked, so the sender can’t see when you read this.
+              </span>
+              <span className="ml-auto flex items-center gap-3">
+                <button type="button" onClick={() => setLoadOnce(true)} className="link-draw font-semibold text-primary">
+                  Load images
+                </button>
+                {onTrustSender && senderAddress && (
+                  <button type="button" onClick={() => onTrustSender(senderAddress)} className="link-draw font-semibold text-primary">
+                    Always for {senderAddress}
+                  </button>
+                )}
+              </span>
+            </motion.div>
+          )}
+
           {/* The letter itself, on paper */}
           <motion.div
             initial={{ opacity: 0, y: 24, clipPath: 'inset(0 0 100% 0 round 16px)' }}
@@ -255,8 +295,8 @@ function Letter({ email, associations, onReply, onTriggerMod, onToggleStar, onOp
             transition={{ duration: 0.9, delay: 0.22, ease: EASE_OUT_EXPO }}
             className="mt-6 select-text rounded-2xl border border-[#E9DCC9] bg-[#FFFDF8] p-5 text-[#2B1E16] shadow-warm xl:p-6"
           >
-            {email.bodyHtml ? (
-              <div className="overflow-x-auto text-sm leading-relaxed" dangerouslySetInnerHTML={{ __html: sanitizedHtml }} />
+            {page ? (
+              <EmailFrame srcdoc={page.srcdoc} title={`Email: ${email.subject}`} />
             ) : (
               <div className="whitespace-pre-wrap text-[14.5px] leading-[1.75]">{email.bodyText || email.snippet}</div>
             )}

@@ -18,7 +18,8 @@
 ### Private by design
 - **Isolated account enclaves.** Each mailbox gets its own folder of local data, so accounts never mix.
 - **Your password stays on your PC.** Passwords are encrypted with the operating system's keychain (Electron `safeStorage`) and never reach the user interface.
-- **Sandboxed reader.** HTML email is cleaned with DOMPurify before display: scripts, iframes, forms and inline event handlers are stripped.
+- **Sandboxed reader.** HTML email is cleaned with DOMPurify and shown in a sealed iframe: scripts never run, its styles can't touch the app, and links open in your browser.
+- **No tracking pixels.** Remote images are blocked until you choose **Load images**, or **Always** for a sender you trust.
 - **No telemetry, no cloud.** The app talks only to your own mail servers. Fonts are bundled, so it doesn't call Google Fonts or any CDN.
 
 ### Fast, live sync
@@ -126,9 +127,9 @@ Enclave Mail is **alpha** software. Things it does not do yet:
 - Read and star changes stay local; they aren't sent back to the server as `\Seen` / `\Flagged` flags.
 - Only the newest 50 messages per folder are synced; there's no server-side search or paging yet.
 - Attachments are listed but can't be downloaded yet.
-- Remote images in HTML email are not blocked yet, and an email's own styles aren't isolated from the app. Both are planned, through a sandboxed iframe reader.
+- **Always for this sender** trusts the From address, which senders can fake. A forged letter from a trusted address loads its images. Checking SPF/DKIM results is planned.
 - Outlook / Microsoft 365 needs OAuth2.
-- No packaged installer or automated tests yet.
+- No packaged installer yet.
 
 ## Contributing
 

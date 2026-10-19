@@ -8,6 +8,8 @@ const WORDMARK = ['Enclave', 'Mail'];
 export function BootSplash() {
   return (
     <motion.div
+      role="status"
+      aria-label="Starting Enclave Mail"
       className="fixed inset-0 z-[90] grid place-items-center bg-background/40 backdrop-blur-[2px]"
       exit={{ opacity: 0, scale: 1.04, filter: 'blur(10px)', transition: { duration: 0.6, ease: EASE_IN_OUT } }}
     >

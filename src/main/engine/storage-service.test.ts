@@ -196,4 +196,18 @@ describe('StorageService', () => {
     storage.saveSyncedMessages(PROVIDER, [snapshot([1], [email('inbox', '7', 1)])]);
     expect(storage.getEmailDetail(PROVIDER, '../../providers')).toBeNull();
   });
+
+  it('remembers senders whose remote images the user allowed, normalised and once each', () => {
+    expect(storage.getTrustedSenders(PROVIDER)).toEqual([]);
+    storage.trustSender(PROVIDER, '  News@Acme.com ');
+    expect(storage.trustSender(PROVIDER, 'news@acme.com')).toEqual(['news@acme.com']);
+    expect(storage.trustSender(PROVIDER, 'ana@acme.com')).toEqual(['news@acme.com', 'ana@acme.com']);
+  });
+
+  it('refuses anything that is not a plain address as a trusted sender', () => {
+    for (const bad of ['', 'not-an-address', 'a@b c.com', 'x'.repeat(300) + '@acme.com', 42 as unknown as string]) {
+      expect(() => storage.trustSender(PROVIDER, bad)).toThrow('Invalid sender address');
+    }
+    expect(storage.getTrustedSenders(PROVIDER)).toEqual([]);
+  });
 });
